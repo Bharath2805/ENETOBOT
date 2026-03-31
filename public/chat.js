@@ -1,4 +1,5 @@
 const SESSION_KEY = "chatbot-session-id";
+const WEB_SEARCH_TOGGLE_KEY = "chatbot-web-search-enabled";
 const MAX_TEXTAREA_HEIGHT = 140;
 const MAX_SESSION_FILES = 20;
 const STARTER_PROMPTS = [
@@ -21,6 +22,8 @@ const inputEl = document.getElementById("chat-input");
 const sendBtn = document.getElementById("send-btn");
 const fileBtn = document.getElementById("file-btn");
 const fileInputEl = document.getElementById("file-input");
+const webSearchToggleEl = document.getElementById("web-search-toggle");
+const webSearchStatusEl = document.getElementById("web-search-status");
 const resetBtn = document.getElementById("reset-btn");
 const starterRowEl = document.getElementById("starter-row");
 const attachmentRowEl = document.getElementById("attachment-row");
@@ -28,6 +31,7 @@ const inputHintEl = document.getElementById("input-hint");
 
 let sessionId = getOrCreateSessionId();
 let attachments = [];
+let isWebSearchEnabled = getStoredWebSearchPreference();
 let isStreaming = false;
 let isUploading = false;
 let hintOverride = "";
@@ -47,6 +51,10 @@ function getOrCreateSessionId() {
   return newId;
 }
 
+function getStoredWebSearchPreference() {
+  return localStorage.getItem(WEB_SEARCH_TOGGLE_KEY) === "true";
+}
+
 function getTimeLabel() {
   return new Date().toLocaleTimeString([], {
     hour: "numeric",
@@ -58,6 +66,14 @@ function updateComposerState() {
   sendBtn.disabled = !inputEl.value.trim() || isStreaming || isUploading;
   fileBtn.disabled =
     isStreaming || isUploading || attachments.length >= MAX_SESSION_FILES;
+  webSearchToggleEl.disabled = isStreaming || isUploading;
+  webSearchToggleEl.setAttribute(
+    "aria-checked",
+    isWebSearchEnabled ? "true" : "false"
+  );
+  webSearchToggleEl.classList.toggle("is-on", isWebSearchEnabled);
+  webSearchStatusEl.textContent = isWebSearchEnabled ? "Always on" : "Off";
+  webSearchStatusEl.classList.toggle("is-on", isWebSearchEnabled);
 
   if (hintOverride) {
     inputHintEl.textContent = hintOverride;
@@ -72,6 +88,8 @@ function updateComposerState() {
 
   if (isUploading && pendingUploadLabel) {
     parts.push(`Uploading ${pendingUploadLabel}...`);
+  } else if (isWebSearchEnabled) {
+    parts.push("Web search is on for every message");
   } else if (attachments.length) {
     parts.push(
       `${attachments.length} attached file${attachments.length === 1 ? "" : "s"} in this chat`
@@ -524,8 +542,8 @@ function showWelcome() {
     <h2 class="welcome-title">Answers that feel clear, current, and easy to act on.</h2>
     <p class="welcome-copy">
       Ask about Eneto, product capabilities, onboarding, live updates, uploaded documents,
-      or the best next step. I can also pull current web context whenever you add
-      <code>search web</code>.
+      or the best next step. Turn on <code>Web search</code> for live lookups on every
+      message, or add <code>search web</code> only when you need it.
     </p>
   `;
 
@@ -672,7 +690,11 @@ async function sendMessage() {
       headers: {
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ message: text, sessionId })
+      body: JSON.stringify({
+        message: text,
+        sessionId,
+        forceWebSearch: isWebSearchEnabled
+      })
     });
 
     if (!response.ok) {
@@ -793,6 +815,19 @@ fileBtn.addEventListener("click", () => {
   }
 
   fileInputEl.click();
+});
+
+webSearchToggleEl.addEventListener("click", () => {
+  if (webSearchToggleEl.disabled) {
+    return;
+  }
+
+  isWebSearchEnabled = !isWebSearchEnabled;
+  localStorage.setItem(
+    WEB_SEARCH_TOGGLE_KEY,
+    isWebSearchEnabled ? "true" : "false"
+  );
+  updateComposerState();
 });
 
 fileInputEl.addEventListener("change", () => {

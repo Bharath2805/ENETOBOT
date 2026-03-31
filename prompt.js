@@ -73,11 +73,79 @@ const SEARCH_TRIGGER_KEYWORDS = [
   "who is"
 ];
 
+const EXPLICIT_WEB_SEARCH_REGEX = /\b(?:search web|look it up|search online)\b/gi;
+
+const TIME_SENSITIVE_SEARCH_KEYWORDS = [
+  "today",
+  "latest",
+  "current",
+  "right now",
+  "news",
+  "this week",
+  "this year",
+  "recently",
+  "update",
+  "release",
+  "what is happening",
+  "2025",
+  "2026"
+];
+
+const OFFICIAL_DOMAIN_SEARCH_KEYWORDS = [
+  "eneto",
+  "product",
+  "platform",
+  "feature",
+  "features",
+  "docs",
+  "documentation",
+  "onboarding",
+  "pricing",
+  "demo",
+  "release",
+  "update",
+  "security",
+  "integration",
+  "support",
+  "faq",
+  "api"
+];
+
+function normalizeMessage(message) {
+  return String(message || "").trim();
+}
+
 function needsWebSearch(message) {
-  const normalizedMessage = String(message || "").toLowerCase();
+  const normalizedMessage = normalizeMessage(message).toLowerCase();
   return SEARCH_TRIGGER_KEYWORDS.some((keyword) =>
     normalizedMessage.includes(keyword)
   );
+}
+
+function buildWebSearchRequest(message, officialDomains = []) {
+  const originalMessage = normalizeMessage(message);
+  const cleanedQuery = originalMessage
+    .replace(EXPLICIT_WEB_SEARCH_REGEX, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const query = cleanedQuery || originalMessage;
+  const normalizedQuery = query.toLowerCase();
+  const topic = TIME_SENSITIVE_SEARCH_KEYWORDS.some((keyword) =>
+    normalizedQuery.includes(keyword)
+  )
+    ? "news"
+    : "general";
+  const includeDomains = OFFICIAL_DOMAIN_SEARCH_KEYWORDS.some((keyword) =>
+    normalizedQuery.includes(keyword)
+  )
+    ? officialDomains.filter(Boolean)
+    : [];
+
+  return {
+    query,
+    topic,
+    includeDomains
+  };
 }
 
 function formatTurn(turn) {
@@ -121,6 +189,7 @@ module.exports = {
   SYSTEM_PROMPT,
   SEARCH_TRIGGER_KEYWORDS,
   needsWebSearch,
+  buildWebSearchRequest,
   buildPrompt,
   buildSummaryPrompt
 };

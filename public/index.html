@@ -30,6 +30,45 @@
       <footer class="composer">
         <div id="starter-row" class="starter-row" aria-label="Suggested prompts"></div>
         <div id="attachment-row" class="attachment-row" aria-live="polite"></div>
+        <div class="tool-row">
+          <div
+            class="search-control"
+            role="group"
+            aria-labelledby="web-search-label"
+            aria-describedby="web-search-description"
+          >
+            <div class="search-control-copy">
+              <div class="search-control-heading">
+                <span id="web-search-label" class="search-control-label"
+                  >Web search</span
+                >
+                <span
+                  id="web-search-status"
+                  class="search-control-status"
+                  aria-hidden="true"
+                  >Off</span
+                >
+              </div>
+              <p id="web-search-description" class="search-control-description">
+                Pull live sources for time-sensitive questions, or just type
+                <code>search web</code> in your message.
+              </p>
+            </div>
+            <button
+              id="web-search-toggle"
+              class="switch-toggle"
+              type="button"
+              role="switch"
+              aria-checked="false"
+              aria-labelledby="web-search-label"
+              aria-describedby="web-search-description"
+            >
+              <span class="switch-track" aria-hidden="true">
+                <span class="switch-thumb"></span>
+              </span>
+            </button>
+          </div>
+        </div>
         <div class="input-row">
           <button id="file-btn" class="icon-btn" type="button" aria-label="Upload file">
             <svg viewBox="0 0 24 24" aria-hidden="true">

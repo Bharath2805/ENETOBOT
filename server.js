@@ -17,6 +17,7 @@ const config = require("./config");
 const {
   SYSTEM_PROMPT,
   needsWebSearch,
+  buildWebSearchRequest,
   buildPrompt,
   buildSummaryPrompt
 } = require("./prompt");
@@ -486,7 +487,7 @@ async function pruneExpiredMediaAttachments(session) {
   );
 }
 
-async function searchWeb(query) {
+async function runTavilySearch(query, options = {}) {
   if (!tavilyApiKey) {
     return null;
   }
@@ -507,9 +508,16 @@ async function searchWeb(query) {
       signal: controller.signal,
       body: JSON.stringify({
         query,
+        topic: options.topic || "general",
         search_depth: "basic",
         max_results: config.MAX_SEARCH_RESULTS,
-        include_answer: true
+        include_answer: "basic",
+        ...(options.timeRange
+          ? { time_range: options.timeRange }
+          : {}),
+        ...(options.includeDomains?.length
+          ? { include_domains: options.includeDomains }
+          : {})
       })
     });
 
@@ -568,6 +576,26 @@ async function searchWeb(query) {
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+async function searchWeb(query, options = {}) {
+  const primaryResult = await runTavilySearch(query, options);
+
+  if (primaryResult) {
+    return primaryResult;
+  }
+
+  const shouldRetryGeneral = options.topic === "news";
+
+  if (!shouldRetryGeneral) {
+    return null;
+  }
+
+  return runTavilySearch(query, {
+    ...options,
+    topic: "general",
+    timeRange: null
+  });
 }
 
 async function summarizeTurns(turns) {
@@ -785,6 +813,7 @@ app.post("/api/chat", async (req, res) => {
   const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
   const sessionId =
     typeof req.body?.sessionId === "string" ? req.body.sessionId.trim() : "";
+  const forceWebSearch = req.body?.forceWebSearch === true;
 
   if (!message || !sessionId) {
     return res.status(400).json({ error: "message and sessionId are required" });
@@ -842,14 +871,26 @@ app.post("/api/chat", async (req, res) => {
       }
     }
 
-    const shouldSearch = needsWebSearch(message);
+    const shouldSearch = forceWebSearch || needsWebSearch(message);
+    const webSearchRequest = shouldSearch
+      ? buildWebSearchRequest(message, config.OFFICIAL_WEB_DOMAINS)
+      : null;
 
     if (shouldSearch) {
       send({ type: "status", content: "searching" });
     }
 
     const [webContext] = await Promise.all([
-      shouldSearch ? searchWeb(message) : Promise.resolve(null)
+      webSearchRequest
+        ? searchWeb(webSearchRequest.query, {
+            topic: webSearchRequest.topic,
+            timeRange:
+              webSearchRequest.topic === "news"
+                ? config.SEARCH_NEWS_TIME_RANGE
+                : null,
+            includeDomains: webSearchRequest.includeDomains
+          })
+        : Promise.resolve(null)
       // Phase 2: ragSearch goes here
     ]);
 

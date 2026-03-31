@@ -4,6 +4,7 @@ module.exports = {
   MAX_HISTORY_TURNS: 10,
   SUMMARY_KEEP_TURNS: 5,
   SEARCH_TIMEOUT_MS: 7000,
+  SEARCH_NEWS_TIME_RANGE: "month",
   MAX_SEARCH_RESULTS: 3,
   MAX_INPUT_CHARS: 2000,
   MAX_UPLOAD_BYTES: 100 * 1024 * 1024,
@@ -13,6 +14,7 @@ module.exports = {
   UPLOAD_POLL_ATTEMPTS: 60,
   UPLOAD_RATE_LIMIT_RPM: 6,
   RATE_LIMIT_RPM: 15,
+  OFFICIAL_WEB_DOMAINS: ["docs.eneto.com", "eneto.com"],
   DOCS_URL: "https://docs.eneto.com",
   FALLBACK_MESSAGE:
     "I hit a temporary issue. Please try again in a moment, or check https://docs.eneto.com."
