@@ -1,11 +1,10 @@
-require("dotenv").config();
-
 const express = require("express");
 const fs = require("fs/promises");
 const os = require("os");
 const path = require("path");
 const cors = require("cors");
 const multer = require("multer");
+const dotenv = require("dotenv");
 const {
   DocumentState,
   FileState,
@@ -21,6 +20,11 @@ const {
   buildPrompt,
   buildSummaryPrompt
 } = require("./prompt");
+
+if (!process.env.VERCEL) {
+  dotenv.config({ path: path.join(__dirname, ".env.local") });
+  dotenv.config({ path: path.join(__dirname, ".env") });
+}
 
 const app = express();
 const publicDir = path.join(__dirname, "public");
