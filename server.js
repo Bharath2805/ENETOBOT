@@ -28,7 +28,16 @@ if (!process.env.VERCEL) {
 
 const app = express();
 const publicDir = path.join(__dirname, "public");
-const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+const geminiApiKey =
+  process.env.GEMINI_API_KEY ||
+  process.env.GOOGLE_API_KEY ||
+  process.env.GOOGLE_API ||
+  "";
+const tavilyApiKey =
+  process.env.TAVILY_API_KEY ||
+  process.env.TAVILY_API ||
+  "";
+const genAI = new GoogleGenAI({ apiKey: geminiApiKey });
 const sessions = new Map();
 const rateLimits = new Map();
 const uploadRateLimits = new Map();
@@ -478,7 +487,7 @@ async function pruneExpiredMediaAttachments(session) {
 }
 
 async function searchWeb(query) {
-  if (!process.env.TAVILY_API_KEY) {
+  if (!tavilyApiKey) {
     return null;
   }
 
@@ -493,7 +502,7 @@ async function searchWeb(query) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.TAVILY_API_KEY}`
+        "Authorization": `Bearer ${tavilyApiKey}`
       },
       signal: controller.signal,
       body: JSON.stringify({
