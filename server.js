@@ -986,6 +986,10 @@ app.get("/health", (_req, res) => {
 
 const PORT = Number(process.env.PORT) || 3000;
 
-app.listen(PORT, () => {
-  console.log(`Chatbot server listening on http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Chatbot server listening on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
