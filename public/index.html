@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Eneto Guide</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Sora:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-dot" aria-hidden="true"></span>
+          <div class="brand-copy">
+            <h1>Eneto Guide</h1>
+            <span class="brand-badge">AI</span>
+          </div>
+        </div>
+        <button id="reset-btn" class="reset-btn" type="button">New chat</button>
+      </header>
+
+      <section id="messages" class="messages" aria-live="polite"></section>
+
+      <footer class="composer">
+        <div id="starter-row" class="starter-row" aria-label="Suggested prompts"></div>
+        <div id="attachment-row" class="attachment-row" aria-live="polite"></div>
+        <div class="input-row">
+          <button id="file-btn" class="icon-btn" type="button" aria-label="Upload file">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M15.7 6.3a4.5 4.5 0 0 0-6.4 0l-4 4a4.5 4.5 0 1 0 6.4 6.4l5-5a3 3 0 0 0-4.2-4.2l-5 5a1.5 1.5 0 0 0 2.1 2.1l4.2-4.2"
+                fill="none"
+                stroke="currentColor"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="1.8"
+              />
+            </svg>
+          </button>
+          <div class="input-shell">
+            <textarea
+              id="chat-input"
+              rows="1"
+              maxlength="2000"
+              placeholder="Ask about Eneto, live updates, onboarding, or upload a file and ask about it..."
+            ></textarea>
+          </div>
+          <button id="send-btn" class="send-btn" type="button" aria-label="Send message">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M3.4 11.3 19.9 4c.9-.4 1.8.5 1.4 1.4l-7.3 16.5c-.4.9-1.7.8-1.9-.2l-1.4-6.1-6.1-1.4c-1-.2-1.1-1.5-.2-1.9Z"
+              />
+            </svg>
+          </button>
+        </div>
+        <input
+          id="file-input"
+          class="sr-only"
+          type="file"
+          accept=".pdf,.txt,.md,.csv,.tsv,.json,.doc,.docx,.xls,.xlsx,.pptx,.html,.xml,.yaml,.yml,.zip,.png,.jpg,.jpeg,.webp,.gif"
+        />
+        <p id="input-hint" class="input-hint">
+          Enter to send · Shift+Enter for new line · Add “search web” for a live lookup · Attach PDFs, Office docs, text files, or images
+        </p>
+      </footer>
+    </main>
+
+    <script src="./chat.js" defer></script>
+  </body>
+</html>
