@@ -2,11 +2,12 @@ const SESSION_KEY = "chatbot-session-id";
 const WEB_SEARCH_TOGGLE_KEY = "chatbot-web-search-enabled";
 const MAX_TEXTAREA_HEIGHT = 140;
 const MAX_SESSION_FILES = 20;
+const INGEST_POLL_INTERVAL_MS = 1500;
 const STARTER_PROMPTS = [
-  "What does Eneto do in simple terms?",
-  "Show me the latest Eneto updates. search web",
-  "How quickly can a team get started with Eneto?",
-  "What is the best next step if I want a demo?"
+  "How does Eneto Connect help lower energy costs?",
+  "Which Eneto system is best for heating and cooling?",
+  "How much funding is available and what qualifies?",
+  "What happens after I request a fixed-price quote?"
 ];
 
 const STATUS_MESSAGES = {
@@ -28,6 +29,7 @@ const resetBtn = document.getElementById("reset-btn");
 const starterRowEl = document.getElementById("starter-row");
 const attachmentRowEl = document.getElementById("attachment-row");
 const inputHintEl = document.getElementById("input-hint");
+const ingestBannerEl = document.getElementById("ingest-banner");
 
 let sessionId = getOrCreateSessionId();
 let attachments = [];
@@ -38,6 +40,9 @@ let hintOverride = "";
 let hintOverrideTimerId = null;
 let pendingUploadLabel = "";
 let scrollRafId = null;
+let ingestBannerTickerId = null;
+const pendingIngestionJobs = new Map();
+const ingestPollTimeoutIds = new Map();
 
 function getOrCreateSessionId() {
   const existingId = sessionStorage.getItem(SESSION_KEY);
@@ -63,10 +68,17 @@ function getTimeLabel() {
 }
 
 function updateComposerState() {
-  sendBtn.disabled = !inputEl.value.trim() || isStreaming || isUploading;
+  const totalAttachmentCount = attachments.length + pendingIngestionJobs.size;
+  const isIndexing = hasActivePendingJobs();
+  const isBlocked = isStreaming || isUploading || isIndexing;
+
+  sendBtn.disabled = !inputEl.value.trim() || isBlocked;
+  inputEl.placeholder = (isIndexing || isUploading)
+    ? "Preparing your file — chat unlocks in a moment..."
+    : "Ask about Eneto, live updates, onboarding, or upload a file and ask about it...";
   fileBtn.disabled =
-    isStreaming || isUploading || attachments.length >= MAX_SESSION_FILES;
-  webSearchToggleEl.disabled = isStreaming || isUploading;
+    isStreaming || isUploading || totalAttachmentCount >= MAX_SESSION_FILES;
+  webSearchToggleEl.disabled = isBlocked;
   webSearchToggleEl.setAttribute(
     "aria-checked",
     isWebSearchEnabled ? "true" : "false"
@@ -74,6 +86,14 @@ function updateComposerState() {
   webSearchToggleEl.classList.toggle("is-on", isWebSearchEnabled);
   webSearchStatusEl.textContent = isWebSearchEnabled ? "Always on" : "Off";
   webSearchStatusEl.classList.toggle("is-on", isWebSearchEnabled);
+
+  if (isIndexing || isUploading) {
+    inputHintEl.textContent = "Chat is locked while your file is being prepared.";
+    updateIngestBanner();
+    return;
+  }
+
+  updateIngestBanner();
 
   if (hintOverride) {
     inputHintEl.textContent = hintOverride;
@@ -83,16 +103,14 @@ function updateComposerState() {
   const parts = [
     "Enter to send",
     "Shift+Enter for new line",
-    "Add “search web” for a live lookup"
+    'Add "search web" for a live lookup'
   ];
 
-  if (isUploading && pendingUploadLabel) {
-    parts.push(`Uploading ${pendingUploadLabel}...`);
-  } else if (isWebSearchEnabled) {
+  if (isWebSearchEnabled) {
     parts.push("Web search is on for every message");
-  } else if (attachments.length) {
+  } else if (totalAttachmentCount) {
     parts.push(
-      `${attachments.length} attached file${attachments.length === 1 ? "" : "s"} in this chat`
+      `${totalAttachmentCount} attached file${totalAttachmentCount === 1 ? "" : "s"} in this chat`
     );
   } else {
     parts.push("Attach PDFs, Office docs, text files, or images");
@@ -257,6 +275,121 @@ function formatBytes(value) {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function getPendingAttachmentStatus(attachment) {
+  if (attachment.errorMessage) {
+    return attachment.errorMessage;
+  }
+
+  const startedAt = Number(attachment.startedAt || 0);
+  const elapsedMs = startedAt ? Date.now() - startedAt : 0;
+  const lowerName = String(attachment.displayName || "").toLowerCase();
+  const isLikelyScan =
+    lowerName.includes("playbook") || lowerName.includes("onboarding");
+
+  if (isLikelyScan && elapsedMs >= 60_000) {
+    return "Running OCR and indexing. Scanned PDFs can take 1-3 minutes.";
+  }
+
+  if (elapsedMs >= 20_000) {
+    return "Indexing document for this chat...";
+  }
+
+  return "Processing...";
+}
+
+function getPendingAttachmentItems() {
+  return Array.from(pendingIngestionJobs.values());
+}
+
+function hasActivePendingJobs() {
+  for (const job of pendingIngestionJobs.values()) {
+    if (!job.errorMessage) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function getActivePendingJob() {
+  for (const job of pendingIngestionJobs.values()) {
+    if (!job.errorMessage) {
+      return job;
+    }
+  }
+
+  return null;
+}
+
+function renderIngestBannerContent() {
+  if (isUploading && pendingUploadLabel) {
+    ingestBannerEl.hidden = false;
+    ingestBannerEl.innerHTML = `
+      <div class="ingest-spinner"></div>
+      <div class="ingest-banner-text">
+        <strong>Uploading ${escapeHtml(pendingUploadLabel)}</strong>
+        <span class="ingest-banner-sub">Sending your file to secure storage — chat unlocks once it's indexed.</span>
+      </div>`;
+    return;
+  }
+
+  const activeJob = getActivePendingJob();
+
+  if (!activeJob) {
+    ingestBannerEl.hidden = true;
+    ingestBannerEl.innerHTML = "";
+    return;
+  }
+
+  const startedAt = Number(activeJob.startedAt || 0);
+  const elapsedMs = startedAt ? Date.now() - startedAt : 0;
+  const name = escapeHtml(activeJob.displayName || "your file");
+  const lowerName = String(activeJob.displayName || "").toLowerCase();
+  const isLikelyScan = lowerName.includes("playbook") || lowerName.includes("onboarding");
+  let mainText;
+  let subText;
+
+  if (isLikelyScan && elapsedMs >= 30_000) {
+    mainText = `Running OCR on <strong>${name}</strong>`;
+    subText = "Scanned PDFs need extra processing — usually 1–3 minutes total. Almost there.";
+  } else if (elapsedMs >= 25_000) {
+    mainText = `Still indexing <strong>${name}</strong>`;
+    subText = "Large or complex PDFs take a little longer. Chat unlocks as soon as it's ready.";
+  } else {
+    mainText = `Indexing <strong>${name}</strong>`;
+    subText = "Building a searchable index so you can ask questions about it — usually about 30 seconds.";
+  }
+
+  ingestBannerEl.hidden = false;
+  ingestBannerEl.innerHTML = `
+    <div class="ingest-spinner"></div>
+    <div class="ingest-banner-text">
+      ${mainText}
+      <span class="ingest-banner-sub">${subText}</span>
+    </div>`;
+}
+
+function updateIngestBanner() {
+  renderIngestBannerContent();
+
+  const shouldTick = isUploading || hasActivePendingJobs();
+
+  if (shouldTick && !ingestBannerTickerId) {
+    ingestBannerTickerId = setInterval(() => {
+      if (!isUploading && !hasActivePendingJobs()) {
+        clearInterval(ingestBannerTickerId);
+        ingestBannerTickerId = null;
+        return;
+      }
+
+      renderIngestBannerContent();
+    }, 5000);
+  } else if (!shouldTick && ingestBannerTickerId) {
+    clearInterval(ingestBannerTickerId);
+    ingestBannerTickerId = null;
+  }
+}
+
 function getBubbleParts(bubbleEl) {
   return {
     statusEl: bubbleEl.querySelector(".bubble-status"),
@@ -419,7 +552,7 @@ function appendSourcesToBubble(bubbleEl, sources) {
 function renderAttachments() {
   attachmentRowEl.innerHTML = "";
 
-  const items = [...attachments];
+  const items = [...attachments, ...getPendingAttachmentItems()];
 
   if (pendingUploadLabel) {
     items.push({
@@ -436,6 +569,7 @@ function renderAttachments() {
   for (const attachment of items) {
     const chip = document.createElement("div");
     chip.className = `attachment-chip${attachment.isPending ? " is-pending" : ""}`;
+    chip.dataset.attachmentId = attachment.id || "";
 
     const copy = document.createElement("div");
     copy.className = "attachment-copy";
@@ -459,20 +593,29 @@ function renderAttachments() {
       metaParts.push(sizeLabel);
     }
 
-    meta.textContent = attachment.isPending
-      ? "Uploading and indexing for retrieval..."
-      : metaParts.join(" · ") || "Ready for this chat";
+    if (attachment.isPending) {
+      meta.textContent = getPendingAttachmentStatus(attachment);
+    } else {
+      meta.textContent = metaParts.join(" · ") || "Ready for this chat";
+    }
 
     copy.append(title, meta);
     chip.appendChild(copy);
 
-    if (!attachment.isPending) {
+    if (!attachment.isPending || attachment.errorMessage) {
       const removeBtn = document.createElement("button");
       removeBtn.type = "button";
       removeBtn.className = "attachment-remove";
       removeBtn.textContent = "Remove";
       removeBtn.disabled = isUploading || isStreaming;
       removeBtn.addEventListener("click", () => {
+        if (attachment.errorMessage) {
+          pendingIngestionJobs.delete(attachment.id);
+          renderAttachments();
+          updateComposerState();
+          return;
+        }
+
         removeAttachment(attachment.id);
       });
       chip.appendChild(removeBtn);
@@ -538,13 +681,27 @@ function showWelcome() {
   const welcome = document.createElement("section");
   welcome.className = "welcome-state";
   welcome.innerHTML = `
-    <span class="welcome-kicker">Website assistant</span>
-    <h2 class="welcome-title">Answers that feel clear, current, and easy to act on.</h2>
+    <span class="welcome-kicker">Eneto assistant</span>
+    <h2 class="welcome-title">Get fast answers on products, funding, installation, and Eneto Connect.</h2>
     <p class="welcome-copy">
-      Ask about Eneto, product capabilities, onboarding, live updates, uploaded documents,
-      or the best next step. Turn on <code>Web search</code> for live lookups on every
-      message, or add <code>search web</code> only when you need it.
+      Ask about heating and cooling systems, fixed-price offers, financing, funding eligibility,
+      or uploaded documents. Turn on <code>Web search</code> for current answers, or add
+      <code>search web</code> only when you need a live lookup.
     </p>
+    <div class="welcome-feature-grid">
+      <article class="welcome-feature">
+        <strong>Products and installation</strong>
+        <span>Compare systems, understand timelines, and plan the next step clearly.</span>
+      </article>
+      <article class="welcome-feature">
+        <strong>Funding and financing</strong>
+        <span>Use live web lookups for current eligibility, pricing context, and updates.</span>
+      </article>
+      <article class="welcome-feature">
+        <strong>Files and quotes</strong>
+        <span>Upload PDFs, spreadsheets, or proposals and ask the assistant to break them down.</span>
+      </article>
+    </div>
   `;
 
   const chipGroup = document.createElement("div");
@@ -571,10 +728,104 @@ function showErrorInBubble(bubbleEl, message) {
   finalizeAssistantBubble(bubbleEl);
 }
 
+function stopIngestionPolling(documentId) {
+  const timeoutId = ingestPollTimeoutIds.get(documentId);
+
+  if (timeoutId) {
+    clearTimeout(timeoutId);
+    ingestPollTimeoutIds.delete(documentId);
+  }
+}
+
+function scheduleIngestionPolling(jobId, documentId) {
+  stopIngestionPolling(documentId);
+
+  let networkErrorCount = 0;
+  const MAX_NETWORK_ERRORS = 4;
+
+  const poll = async () => {
+    try {
+      const response = await fetch(
+        `/api/ingest/status/${encodeURIComponent(jobId)}`
+      );
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        throw new Error(data?.error || "Processing failed.");
+      }
+
+      // Reset transient error count on any successful response
+      networkErrorCount = 0;
+
+      const pendingAttachment = pendingIngestionJobs.get(documentId);
+
+      if (!pendingAttachment) {
+        stopIngestionPolling(documentId);
+        return;
+      }
+
+      if (data?.status === "done") {
+        pendingIngestionJobs.delete(documentId);
+        stopIngestionPolling(documentId);
+        await loadSessionAttachments();
+        renderAttachments();
+        updateComposerState();
+        return;
+      }
+
+      if (data?.status === "failed") {
+        pendingIngestionJobs.set(documentId, {
+          ...pendingAttachment,
+          errorMessage: data?.errorMessage || "Indexing failed. Remove and try again."
+        });
+        stopIngestionPolling(documentId);
+        renderAttachments();
+        updateComposerState();
+        return;
+      }
+
+      // Still processing — update display and continue polling
+      pendingIngestionJobs.set(documentId, { ...pendingAttachment });
+      renderAttachments();
+      updateComposerState();
+
+      const timeoutId = setTimeout(poll, INGEST_POLL_INTERVAL_MS);
+      ingestPollTimeoutIds.set(documentId, timeoutId);
+    } catch (error) {
+      const pendingAttachment = pendingIngestionJobs.get(documentId);
+
+      if (!pendingAttachment) {
+        stopIngestionPolling(documentId);
+        return;
+      }
+
+      networkErrorCount += 1;
+
+      // Retry up to MAX_NETWORK_ERRORS times before giving up
+      if (networkErrorCount < MAX_NETWORK_ERRORS) {
+        const retryDelay = Math.min(INGEST_POLL_INTERVAL_MS * networkErrorCount, 8000);
+        const timeoutId = setTimeout(poll, retryDelay);
+        ingestPollTimeoutIds.set(documentId, timeoutId);
+        return;
+      }
+
+      pendingIngestionJobs.set(documentId, {
+        ...pendingAttachment,
+        errorMessage: "Could not reach the server. Remove and try again."
+      });
+      stopIngestionPolling(documentId);
+      renderAttachments();
+      updateComposerState();
+    }
+  };
+
+  void poll();
+}
+
 async function loadSessionAttachments() {
   try {
     const response = await fetch(
-      `/api/attachments?sessionId=${encodeURIComponent(sessionId)}`
+      `/api/attachments?sessionId=${encodeURIComponent(sessionId)}&refresh=1`
     );
 
     if (!response.ok) {
@@ -583,6 +834,16 @@ async function loadSessionAttachments() {
 
     const data = await response.json();
     attachments = Array.isArray(data.attachments) ? data.attachments : [];
+
+    // Clear any pending chips that are now confirmed in the session
+    const confirmedIds = new Set(attachments.map((a) => a.id));
+    for (const [id] of pendingIngestionJobs.entries()) {
+      if (confirmedIds.has(id)) {
+        stopIngestionPolling(id);
+        pendingIngestionJobs.delete(id);
+      }
+    }
+
     renderAttachments();
     updateComposerState();
   } catch (_error) {
@@ -616,7 +877,33 @@ async function uploadSelectedFile(file) {
       throw new Error(data?.error || "Upload failed.");
     }
 
-    attachments = Array.isArray(data?.attachments) ? data.attachments : attachments;
+    if (data?.jobId && data?.documentId) {
+      // Remove any previous failed chip for the same filename before adding the new one
+      for (const [existingId, existing] of pendingIngestionJobs.entries()) {
+        if (
+          existing.displayName === file.name &&
+          (existing.errorMessage || existing.id !== data.documentId)
+        ) {
+          stopIngestionPolling(existingId);
+          pendingIngestionJobs.delete(existingId);
+        }
+      }
+
+      pendingIngestionJobs.set(data.documentId, {
+        id: data.documentId,
+        jobId: data.jobId,
+        displayName: file.name,
+        mimeType: file.type || "application/pdf",
+        sizeBytes: file.size,
+        startedAt: Date.now(),
+        isPending: true,
+        errorMessage: ""
+      });
+      scheduleIngestionPolling(data.jobId, data.documentId);
+    } else {
+      attachments = Array.isArray(data?.attachments) ? data.attachments : attachments;
+    }
+
     renderAttachments();
   } catch (error) {
     setHintOverride(error.message || "Upload failed.");
@@ -669,7 +956,7 @@ async function removeAttachment(attachmentId) {
 async function sendMessage() {
   const text = inputEl.value.trim();
 
-  if (!text || isStreaming || isUploading) {
+  if (!text || isStreaming || isUploading || hasActivePendingJobs()) {
     return;
   }
 
@@ -862,6 +1149,10 @@ resetBtn.addEventListener("click", async () => {
   sessionId = crypto.randomUUID();
   sessionStorage.setItem(SESSION_KEY, sessionId);
   attachments = [];
+  for (const documentId of ingestPollTimeoutIds.keys()) {
+    stopIngestionPolling(documentId);
+  }
+  pendingIngestionJobs.clear();
   pendingUploadLabel = "";
   hintOverride = "";
   renderAttachments();

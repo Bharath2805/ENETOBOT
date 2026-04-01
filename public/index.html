@@ -5,98 +5,119 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Eneto Guide</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Sora:wght@500;600;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Outfit:wght@500;600;700&display=swap"
       rel="stylesheet"
     />
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
     <main class="app-shell">
       <header class="topbar">
-        <div class="brand">
-          <span class="brand-dot" aria-hidden="true"></span>
-          <div class="brand-copy">
-            <h1>Eneto Guide</h1>
-            <span class="brand-badge">AI</span>
+        <div class="topbar-inner">
+          <div class="brand">
+            <span class="brand-mark">
+              <img class="brand-logo" src="./eneto-logo.svg" alt="Eneto" />
+            </span>
+            <div class="brand-copy">
+              <span class="brand-eyebrow">Eneto assistant</span>
+              <h1>Products, funding, installation, and Eneto Connect guidance</h1>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <div class="topbar-pills" aria-hidden="true">
+              <span class="topbar-pill">Live web search</span>
+              <span class="topbar-pill">Files and docs</span>
+            </div>
+            <button id="reset-btn" class="reset-btn" type="button">New chat</button>
           </div>
         </div>
-        <button id="reset-btn" class="reset-btn" type="button">New chat</button>
       </header>
 
       <section id="messages" class="messages" aria-live="polite"></section>
 
       <footer class="composer">
-        <div id="starter-row" class="starter-row" aria-label="Suggested prompts"></div>
-        <div id="attachment-row" class="attachment-row" aria-live="polite"></div>
-        <div class="tool-row">
-          <div
-            class="search-control"
-            role="group"
-            aria-labelledby="web-search-label"
-            aria-describedby="web-search-description"
-          >
-            <div class="search-control-copy">
-              <div class="search-control-heading">
-                <span id="web-search-label" class="search-control-label"
-                  >Web search</span
-                >
-                <span
-                  id="web-search-status"
-                  class="search-control-status"
-                  aria-hidden="true"
-                  >Off</span
-                >
-              </div>
-              <p id="web-search-description" class="search-control-description">
-                Pull live sources for time-sensitive questions, or just type
-                <code>search web</code> in your message.
-              </p>
-            </div>
-            <button
-              id="web-search-toggle"
-              class="switch-toggle"
-              type="button"
-              role="switch"
-              aria-checked="false"
+        <div class="composer-shell">
+          <div id="starter-row" class="starter-row" aria-label="Suggested prompts"></div>
+          <div id="attachment-row" class="attachment-row" aria-live="polite"></div>
+          <div id="ingest-banner" class="ingest-banner" hidden role="status" aria-live="polite"></div>
+          <div class="tool-row">
+            <div
+              class="search-control"
+              role="group"
               aria-labelledby="web-search-label"
               aria-describedby="web-search-description"
             >
-              <span class="switch-track" aria-hidden="true">
-                <span class="switch-thumb"></span>
-              </span>
+              <div class="search-control-copy">
+                <div class="search-control-heading">
+                  <span id="web-search-label" class="search-control-label"
+                    >Web search</span
+                  >
+                  <span
+                    id="web-search-status"
+                    class="search-control-status"
+                    aria-hidden="true"
+                    >Off</span
+                  >
+                </div>
+                <p id="web-search-description" class="search-control-description">
+                  Use live sources for time-sensitive questions like funding rules,
+                  pricing, or the latest Eneto updates.
+                </p>
+              </div>
+              <button
+                id="web-search-toggle"
+                class="switch-toggle"
+                type="button"
+                role="switch"
+                aria-checked="false"
+                aria-labelledby="web-search-label"
+                aria-describedby="web-search-description"
+              >
+                <span class="switch-track" aria-hidden="true">
+                  <span class="switch-thumb"></span>
+                </span>
+              </button>
+            </div>
+          </div>
+          <div class="composer-heading">
+            <div>
+              <p class="composer-label">Ask Eneto</p>
+              <p class="composer-subcopy">
+                Ask about products, financing, installation, Eneto Connect, or upload a document for help.
+              </p>
+            </div>
+          </div>
+          <div class="input-row">
+            <button id="file-btn" class="icon-btn" type="button" aria-label="Upload file">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M15.7 6.3a4.5 4.5 0 0 0-6.4 0l-4 4a4.5 4.5 0 1 0 6.4 6.4l5-5a3 3 0 0 0-4.2-4.2l-5 5a1.5 1.5 0 0 0 2.1 2.1l4.2-4.2"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="1.8"
+                />
+              </svg>
+            </button>
+            <div class="input-shell">
+              <textarea
+                id="chat-input"
+                rows="1"
+                maxlength="2000"
+                placeholder="Ask about Eneto, live updates, onboarding, or upload a file and ask about it..."
+              ></textarea>
+            </div>
+            <button id="send-btn" class="send-btn" type="button" aria-label="Send message">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M3.4 11.3 19.9 4c.9-.4 1.8.5 1.4 1.4l-7.3 16.5c-.4.9-1.7.8-1.9-.2l-1.4-6.1-6.1-1.4c-1-.2-1.1-1.5-.2-1.9Z"
+                />
+              </svg>
             </button>
           </div>
-        </div>
-        <div class="input-row">
-          <button id="file-btn" class="icon-btn" type="button" aria-label="Upload file">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                d="M15.7 6.3a4.5 4.5 0 0 0-6.4 0l-4 4a4.5 4.5 0 1 0 6.4 6.4l5-5a3 3 0 0 0-4.2-4.2l-5 5a1.5 1.5 0 0 0 2.1 2.1l4.2-4.2"
-                fill="none"
-                stroke="currentColor"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="1.8"
-              />
-            </svg>
-          </button>
-          <div class="input-shell">
-            <textarea
-              id="chat-input"
-              rows="1"
-              maxlength="2000"
-              placeholder="Ask about Eneto, live updates, onboarding, or upload a file and ask about it..."
-            ></textarea>
-          </div>
-          <button id="send-btn" class="send-btn" type="button" aria-label="Send message">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                d="M3.4 11.3 19.9 4c.9-.4 1.8.5 1.4 1.4l-7.3 16.5c-.4.9-1.7.8-1.9-.2l-1.4-6.1-6.1-1.4c-1-.2-1.1-1.5-.2-1.9Z"
-              />
-            </svg>
-          </button>
         </div>
         <input
           id="file-input"
@@ -105,7 +126,7 @@
           accept=".pdf,.txt,.md,.csv,.tsv,.json,.doc,.docx,.xls,.xlsx,.pptx,.html,.xml,.yaml,.yml,.zip,.png,.jpg,.jpeg,.webp,.gif"
         />
         <p id="input-hint" class="input-hint">
-          Enter to send · Shift+Enter for new line · Add “search web” for a live lookup · Attach PDFs, Office docs, text files, or images
+          Enter to send · Shift+Enter for new line · Add "search web" for a live lookup · Attach PDFs, Office docs, text files, or images
         </p>
       </footer>
     </main>

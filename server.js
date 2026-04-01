@@ -1,12 +1,13 @@
 const express = require("express");
+const { randomUUID } = require("crypto");
 const fs = require("fs/promises");
 const os = require("os");
 const path = require("path");
+const XLSX = require("xlsx");
 const cors = require("cors");
 const multer = require("multer");
 const dotenv = require("dotenv");
 const {
-  DocumentState,
   FileState,
   GoogleGenAI,
   createPartFromUri,
@@ -14,9 +15,11 @@ const {
 } = require("@google/genai");
 
 const config = require("./config");
+const firestoreLib = require("./lib/firestore");
 const {
+  OFFICIAL_REFERENCE_DOMAINS,
   SYSTEM_PROMPT,
-  needsWebSearch,
+  classifyRetrieval,
   buildWebSearchRequest,
   buildPrompt,
   buildSummaryPrompt
@@ -39,9 +42,14 @@ const tavilyApiKey =
   process.env.TAVILY_API ||
   "";
 const genAI = new GoogleGenAI({ apiKey: geminiApiKey });
-const sessions = new Map();
-const rateLimits = new Map();
-const uploadRateLimits = new Map();
+const sessionCache = new Map();
+const sessionCacheTouchedAt = new Map();
+const rateLimitBuckets = new Map();
+const uploadRateLimitBuckets = new Map();
+const SESSION_CACHE_TTL_MS = 30_000;
+let globalStoreConfig = null;
+let globalStoreLoadedAt = 0;
+const GLOBAL_STORE_TTL_MS = 5 * 60_000;
 const upload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, callback) => {
@@ -89,6 +97,20 @@ const DIRECT_MEDIA_MIME_TYPES = new Set([
   "image/webp"
 ]);
 
+const INLINE_LONG_CONTEXT_MIME_TYPES = new Set([
+  "application/json",
+  "application/pdf",
+  "application/xml",
+  "text/csv",
+  "text/html",
+  "text/markdown",
+  "text/plain",
+  "text/tab-separated-values",
+  "text/tsv",
+  "text/xml",
+  "text/yaml"
+]);
+
 const MIME_TYPE_BY_EXTENSION = {
   ".csv": "text/csv",
   ".doc": "application/msword",
@@ -118,8 +140,16 @@ const MIME_TYPE_BY_EXTENSION = {
   ".zip": "application/zip"
 };
 
+const SPREADSHEET_MIME_TYPES = new Set([
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+]);
+
 app.use(cors());
 app.use(express.json());
+app.get("/favicon.ico", (_req, res) => {
+  res.sendFile(path.join(publicDir, "favicon.svg"));
+});
 app.use(express.static(publicDir));
 
 app.get("/", (_req, res) => {
@@ -130,17 +160,301 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function getSession(sessionId) {
-  if (!sessions.has(sessionId)) {
-    sessions.set(sessionId, {
-      attachments: [],
-      fileSearchStoreName: null,
-      turns: [],
-      summary: null
-    });
+function supportsInlineLongContextMimeType(mimeType) {
+  return INLINE_LONG_CONTEXT_MIME_TYPES.has(String(mimeType || "").trim());
+}
+
+function isSpreadsheetMimeType(mimeType) {
+  return SPREADSHEET_MIME_TYPES.has(String(mimeType || "").trim());
+}
+
+function isFileFocusedQuestion(message) {
+  return /\b(file|document|attachment|attached|upload(?:ed)?|sheet|spreadsheet|workbook|excel|csv|xlsx|xls|docx|doc|pdf|proposal|quote)\b/i.test(
+    String(message || "")
+  );
+}
+
+function toDocumentResourceName(fileSearchStoreName, documentName) {
+  if (!documentName) {
+    return "";
   }
 
-  return sessions.get(sessionId);
+  if (documentName.includes("/")) {
+    return documentName;
+  }
+
+  return `${fileSearchStoreName}/documents/${documentName}`;
+}
+
+async function getGlobalStoreConfig() {
+  if (globalStoreConfig && Date.now() - globalStoreLoadedAt < GLOBAL_STORE_TTL_MS) {
+    return globalStoreConfig;
+  }
+
+  const appConfig = await firestoreLib.getAppConfig();
+  globalStoreConfig = {
+    storeName: appConfig?.globalFileSearchStoreName || null,
+    documents: Array.isArray(appConfig?.globalDocuments) ? appConfig.globalDocuments : [],
+    begManufacturers: Array.isArray(appConfig?.begManufacturers)
+      ? appConfig.begManufacturers
+      : [],
+    begRecordCount: Number(appConfig?.begRecordCount || 0)
+  };
+  globalStoreLoadedAt = Date.now();
+  return globalStoreConfig;
+}
+
+function normalizeForMatch(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function tokenizeForRanking(value) {
+  return normalizeForMatch(value)
+    .split(" ")
+    .filter((token) => token.length > 1);
+}
+
+function scoreTextAgainstQuery(query, ...fields) {
+  const queryTokens = [...new Set(tokenizeForRanking(query))];
+  const haystack = normalizeForMatch(fields.join(" "));
+
+  if (!queryTokens.length || !haystack) {
+    return 0;
+  }
+
+  let score = 0;
+
+  for (const token of queryTokens) {
+    if (haystack.includes(token)) {
+      score += token.length >= 4 ? 3 : 1;
+    }
+  }
+
+  const normalizedQuery = normalizeForMatch(query);
+
+  if (normalizedQuery && haystack.includes(normalizedQuery)) {
+    score += 8;
+  }
+
+  return score;
+}
+
+function rerankItems(query, items, getText, extraScore) {
+  return [...items]
+    .map((item, index) => ({
+      item,
+      index,
+      score:
+        scoreTextAgainstQuery(query, getText(item)) +
+        (typeof extraScore === "function" ? extraScore(item) : 0)
+    }))
+    .sort((left, right) => {
+      if (right.score === left.score) {
+        return left.index - right.index;
+      }
+
+      return right.score - left.score;
+    })
+    .map((entry) => entry.item);
+}
+
+function detectHeatPumpType(message) {
+  const normalizedMessage = normalizeForMatch(message);
+
+  if (normalizedMessage.includes("luft wasser")) {
+    return "Luft-Wasser";
+  }
+
+  if (normalizedMessage.includes("sole wasser")) {
+    return "Sole-Wasser";
+  }
+
+  if (normalizedMessage.includes("wasser wasser")) {
+    return "Wasser-Wasser";
+  }
+
+  if (normalizedMessage.includes("luft luft")) {
+    return "Luft-Luft";
+  }
+
+  if (normalizedMessage.includes("abluft wasser")) {
+    return "Abluft-Wasser";
+  }
+
+  return "";
+}
+
+function buildManufacturerAliases(name) {
+  const normalizedName = normalizeForMatch(name);
+  const aliases = new Set([normalizedName]);
+  const companySuffixes = [
+    " gmbh",
+    " ag",
+    " bv",
+    " b v",
+    " b v ",
+    " ltd",
+    " llc",
+    " kg",
+    " inc",
+    " aps",
+    " oy",
+    " sas",
+    " spa",
+    " srl",
+    " as"
+  ];
+  let trimmed = normalizedName;
+
+  for (const suffix of companySuffixes) {
+    if (trimmed.endsWith(suffix)) {
+      trimmed = trimmed.slice(0, -suffix.length).trim();
+      aliases.add(trimmed);
+    }
+  }
+
+  const words = trimmed.split(" ").filter(Boolean);
+
+  if (words[0]) {
+    aliases.add(words[0]);
+  }
+
+  if (words.length >= 2) {
+    aliases.add(words.slice(0, 2).join(" "));
+  }
+
+  return [...aliases].filter(Boolean);
+}
+
+function findManufacturerMatch(message, manufacturers) {
+  const normalizedMessage = normalizeForMatch(message);
+  let bestMatch = null;
+
+  for (const manufacturer of manufacturers) {
+    for (const alias of buildManufacturerAliases(manufacturer)) {
+      if (!alias || !normalizedMessage.includes(alias)) {
+        continue;
+      }
+
+      const score = alias.length + (alias === normalizeForMatch(manufacturer) ? 4 : 0);
+
+      if (!bestMatch || score > bestMatch.score) {
+        bestMatch = {
+          displayName: manufacturer,
+          manufacturerNormalized: normalizeForMatch(manufacturer),
+          alias,
+          score
+        };
+      }
+    }
+  }
+
+  return bestMatch;
+}
+
+function extractModelQuery(message, manufacturerMatch, heatPumpType) {
+  let cleaned = normalizeForMatch(message);
+  const stopPhrases = [
+    "is",
+    "are",
+    "beg",
+    "bafa",
+    "kfw",
+    "eligible",
+    "forderung",
+    "forderfahig",
+    "forderfaehig",
+    "gelistet",
+    "listed",
+    "modell",
+    "model",
+    "warmepumpe",
+    "heat pump",
+    "heat",
+    "pump",
+    "ist",
+    "sind",
+    "fur",
+    "for",
+    "in",
+    "the",
+    "a",
+    "an",
+    "under"
+  ];
+
+  if (manufacturerMatch?.alias) {
+    cleaned = cleaned.replace(manufacturerMatch.alias, " ");
+  }
+
+  if (heatPumpType) {
+    cleaned = cleaned.replace(normalizeForMatch(heatPumpType), " ");
+  }
+
+  for (const phrase of stopPhrases) {
+    cleaned = cleaned.replace(new RegExp(`\\b${phrase}\\b`, "g"), " ");
+  }
+
+  cleaned = cleaned.replace(/\s+/g, " ").trim();
+  return cleaned;
+}
+
+
+function createDefaultSession() {
+  return {
+    attachments: [],
+    fileSearchStoreName: null,
+    turns: [],
+    summary: null
+  };
+}
+
+function normalizeSession(session) {
+  return {
+    attachments: Array.isArray(session?.attachments) ? session.attachments : [],
+    fileSearchStoreName: session?.fileSearchStoreName || null,
+    turns: Array.isArray(session?.turns) ? session.turns : [],
+    summary: session?.summary || null
+  };
+}
+
+async function saveSession(sessionId, session) {
+  await firestoreLib.saveSession(sessionId, session);
+  sessionCache.set(sessionId, session);
+  sessionCacheTouchedAt.set(sessionId, Date.now());
+  return session;
+}
+
+async function getSession(sessionId, options = {}) {
+  const forceRefresh = options?.forceRefresh === true;
+  const cachedSession = sessionCache.get(sessionId);
+  const cachedAt = sessionCacheTouchedAt.get(sessionId) || 0;
+
+  if (
+    !forceRefresh &&
+    cachedSession &&
+    Date.now() - cachedAt < SESSION_CACHE_TTL_MS
+  ) {
+    return cachedSession;
+  }
+
+  const storedSession = await firestoreLib.getSession(sessionId);
+  const session = storedSession
+    ? normalizeSession(storedSession)
+    : createDefaultSession();
+
+  if (!storedSession) {
+    await firestoreLib.saveSession(sessionId, session);
+  }
+
+  sessionCache.set(sessionId, session);
+  sessionCacheTouchedAt.set(sessionId, Date.now());
+  return session;
 }
 
 function isOverLimit(bucket, sessionId, maxRequestsPerMinute) {
@@ -157,12 +471,12 @@ function isOverLimit(bucket, sessionId, maxRequestsPerMinute) {
 }
 
 function isRateLimited(sessionId) {
-  return isOverLimit(rateLimits, sessionId, config.RATE_LIMIT_RPM);
+  return isOverLimit(rateLimitBuckets, sessionId, config.RATE_LIMIT_RPM);
 }
 
 function isUploadRateLimited(sessionId) {
   return isOverLimit(
-    uploadRateLimits,
+    uploadRateLimitBuckets,
     sessionId,
     config.UPLOAD_RATE_LIMIT_RPM
   );
@@ -208,20 +522,6 @@ function resolveUploadDescriptor(file) {
   return null;
 }
 
-function serializeDocument(document) {
-  const name = String(document?.name || "").trim();
-
-  return {
-    id: name.split("/").pop() || "",
-    name,
-    displayName: String(document?.displayName || "Uploaded document"),
-    mimeType: String(document?.mimeType || "").trim(),
-    sizeBytes: Number(document?.sizeBytes || 0),
-    state: String(document?.state || "").trim(),
-    strategy: "document"
-  };
-}
-
 function serializeMediaFile(file, fallbackName) {
   const name = String(file?.name || "").trim();
 
@@ -237,11 +537,63 @@ function serializeMediaFile(file, fallbackName) {
   };
 }
 
+async function convertSpreadsheetToTextFile(file) {
+  let workbook;
+
+  try {
+    workbook = XLSX.readFile(file.path, {
+      cellDates: true,
+      dense: true
+    });
+  } catch (_error) {
+    throw new Error("I couldn’t read that spreadsheet. Please try another Excel file.");
+  }
+
+  const sections = [`Workbook: ${file.originalname}`];
+
+  for (const sheetName of workbook.SheetNames || []) {
+    const sheet = workbook.Sheets?.[sheetName];
+
+    if (!sheet) {
+      continue;
+    }
+
+    const csv = XLSX.utils.sheet_to_csv(sheet, {
+      blankrows: false,
+      strip: true
+    }).trim();
+
+    if (!csv) {
+      continue;
+    }
+
+    sections.push(`Sheet: ${sheetName}\n${csv}`);
+  }
+
+  if (sections.length === 1) {
+    throw new Error("That spreadsheet looks empty, so there wasn’t any text to analyze.");
+  }
+
+  const convertedPath = path.join(
+    os.tmpdir(),
+    `chatboteneto-sheet-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}.txt`
+  );
+
+  await fs.writeFile(convertedPath, sections.join("\n\n"), "utf8");
+
+  return {
+    path: convertedPath,
+    mimeType: "text/plain"
+  };
+}
+
 function buildMediaAttachmentParts(attachments) {
   return attachments
     .filter(
       (attachment) =>
-        attachment?.strategy === "media" &&
+        (attachment?.strategy === "media" || attachment?.strategy === "longcontext") &&
         attachment?.uri &&
         attachment?.mimeType
     )
@@ -293,111 +645,14 @@ function extractDocumentSources(groundingMetadata) {
   return sources;
 }
 
-async function ensureFileSearchStore(session, sessionId) {
-  if (session.fileSearchStoreName) {
-    return session.fileSearchStoreName;
-  }
-
-  const store = await genAI.fileSearchStores.create({
-    config: {
-      displayName: `chatboteneto-${sessionId.slice(0, 8)}`
-    }
-  });
-
-  if (!store?.name) {
-    throw new Error("Could not create a file search store");
-  }
-
-  session.fileSearchStoreName = store.name;
-  return store.name;
-}
-
-async function waitForOperationDone(operation) {
-  let currentOperation = operation;
-
-  for (
-    let attempt = 0;
-    attempt < config.UPLOAD_POLL_ATTEMPTS;
-    attempt += 1
-  ) {
-    if (currentOperation?.done) {
-      if (currentOperation.error) {
-        throw new Error(
-          currentOperation.error.message || "Document processing failed"
-        );
-      }
-
-      return currentOperation;
-    }
-
-    await sleep(config.UPLOAD_POLL_INTERVAL_MS);
-    currentOperation = await genAI.operations.get({
-      operation: currentOperation
-    });
-  }
-
-  // Check the result of the final poll before giving up.
-  if (currentOperation?.done) {
-    if (currentOperation.error) {
-      throw new Error(
-        currentOperation.error.message || "Document processing failed"
-      );
-    }
-
-    return currentOperation;
-  }
-
-  throw new Error(
-    "The uploaded document is still indexing. Please try again in a moment."
-  );
-}
-
-async function waitForDocumentReady(documentName) {
-  let document = await genAI.fileSearchStores.documents.get({
-    name: documentName
-  });
-
-  for (
-    let attempt = 0;
-    attempt < config.UPLOAD_POLL_ATTEMPTS;
-    attempt += 1
-  ) {
-    if (!document?.state || document.state === DocumentState.STATE_ACTIVE) {
-      return document;
-    }
-
-    if (document.state === DocumentState.STATE_FAILED) {
-      throw new Error("Document indexing failed");
-    }
-
-    await sleep(config.UPLOAD_POLL_INTERVAL_MS);
-    document = await genAI.fileSearchStores.documents.get({
-      name: documentName
-    });
-  }
-
-  // Check the result of the final poll before giving up.
-  if (!document?.state || document.state === DocumentState.STATE_ACTIVE) {
-    return document;
-  }
-
-  if (document.state === DocumentState.STATE_FAILED) {
-    throw new Error("Document indexing failed");
-  }
-
-  throw new Error(
-    "The uploaded document is still indexing. Please try again in a moment."
-  );
-}
-
 async function waitForMediaFileReady(fileName) {
+  // Ramp intervals so small files respond in < 2s; cap total wait at ~30s
+  // to stay safely within Vercel's 60s function timeout.
+  const intervals = [500, 500, 1000, 1000, 1500, 1500, 2000];
+
   let currentFile = await genAI.files.get({ name: fileName });
 
-  for (
-    let attempt = 0;
-    attempt < config.UPLOAD_POLL_ATTEMPTS;
-    attempt += 1
-  ) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
     if (!currentFile?.state || currentFile.state === FileState.ACTIVE) {
       return currentFile;
     }
@@ -406,11 +661,11 @@ async function waitForMediaFileReady(fileName) {
       throw new Error(currentFile.error?.message || "File processing failed");
     }
 
-    await sleep(config.UPLOAD_POLL_INTERVAL_MS);
+    const delay = attempt < intervals.length ? intervals[attempt] : 2000;
+    await sleep(delay);
     currentFile = await genAI.files.get({ name: fileName });
   }
 
-  // Check the result of the final poll before giving up.
   if (!currentFile?.state || currentFile.state === FileState.ACTIVE) {
     return currentFile;
   }
@@ -438,6 +693,23 @@ async function deleteGeminiFile(fileName) {
   }
 }
 
+async function deleteFileSearchDocument(documentName) {
+  if (!documentName) {
+    return true;
+  }
+
+  try {
+    await genAI.fileSearchStores.documents.delete({
+      name: documentName,
+      config: { force: true }
+    });
+    return true;
+  } catch (error) {
+    console.error("[deleteFileSearchDocument]", error.message || error);
+    return false;
+  }
+}
+
 async function deleteFileSearchStore(storeName) {
   if (!storeName) {
     return true;
@@ -455,8 +727,193 @@ async function deleteFileSearchStore(storeName) {
   }
 }
 
+async function waitForFileSearchOperationDone(operation) {
+  let currentOperation = operation;
+  const intervals = [500, 500, 750, 1000, 1000, 1500, 1500, 2000];
+
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    if (currentOperation?.done) {
+      if (currentOperation.error) {
+        throw new Error(
+          currentOperation.error.message || "Document processing failed"
+        );
+      }
+
+      return currentOperation;
+    }
+
+    const delay = attempt < intervals.length ? intervals[attempt] : 2000;
+    await sleep(delay);
+    currentOperation = await genAI.operations.get({
+      operation: currentOperation
+    });
+  }
+
+  if (currentOperation?.done) {
+    if (currentOperation.error) {
+      throw new Error(
+        currentOperation.error.message || "Document processing failed"
+      );
+    }
+
+    return currentOperation;
+  }
+
+  throw new Error("The uploaded document is still indexing. Please try again in a moment.");
+}
+
+async function ensureSessionFileSearchStore(session, sessionId) {
+  if (session.fileSearchStoreName) {
+    return session.fileSearchStoreName;
+  }
+
+  const store = await genAI.fileSearchStores.create({
+    config: {
+      displayName: `chatboteneto-${sessionId.slice(0, 8)}`
+    }
+  });
+
+  if (!store?.name) {
+    throw new Error("Could not create a file search store");
+  }
+
+  session.fileSearchStoreName = store.name;
+  await saveSession(sessionId, session);
+  return store.name;
+}
+
+async function importDocumentIntoSessionStore({
+  session,
+  sessionId,
+  documentId,
+  file,
+  uploadedFile,
+  mimeType
+}) {
+  const fileSearchStoreName = await ensureSessionFileSearchStore(session, sessionId);
+  let operation = await genAI.fileSearchStores.importFile({
+    fileSearchStoreName,
+    fileName: uploadedFile.name,
+    config: {}
+  });
+
+  operation = await waitForFileSearchOperationDone(operation);
+  const documentResourceName = toDocumentResourceName(
+    fileSearchStoreName,
+    operation.response?.documentName
+  );
+
+  if (!documentResourceName) {
+    throw new Error("Document indexing completed without a document name");
+  }
+
+  const document = await genAI.fileSearchStores.documents
+    .get({
+      name: documentResourceName
+    })
+    .catch(() => null);
+
+  const attachment = {
+    id: documentId,
+    name: String(document?.name || documentResourceName || "").trim(),
+    displayName: file.originalname,
+    mimeType: String(document?.mimeType || mimeType || "").trim(),
+    sizeBytes: Number(document?.sizeBytes || uploadedFile.sizeBytes || file.size || 0),
+    state: String(document?.state || "").trim(),
+    strategy: "document"
+  };
+
+  await firestoreLib.saveDocument(documentId, {
+    filename: file.originalname,
+    displayTitle: file.originalname,
+    sourceType: "user_upload",
+    language: "en",
+    ingestionStatus: "done",
+    scope: "session",
+    isScan: false,
+    geminiFileName: String(uploadedFile.name || "").trim(),
+    fileSearchStoreName,
+    geminiDocumentName: attachment.name
+  });
+
+  return attachment;
+}
+
+async function processDocumentInBackground({
+  jobId,
+  documentId,
+  sessionId,
+  geminiFileName,
+  originalName,
+  mimeType,
+  sizeBytes
+}) {
+  try {
+    await firestoreLib.updateIngestionJob(jobId, {
+      status: "processing",
+      errorMessage: null
+    });
+
+    const readyFile = await waitForMediaFileReady(geminiFileName);
+    const storedSession = await firestoreLib.getSession(sessionId);
+
+    if (!storedSession) {
+      throw new Error("Session no longer exists.");
+    }
+
+    const session = normalizeSession(storedSession);
+    await pruneExpiredMediaAttachments(sessionId, session);
+
+    const attachment = await importDocumentIntoSessionStore({
+      session,
+      sessionId,
+      documentId,
+      file: {
+        originalname: originalName,
+        size: sizeBytes
+      },
+      uploadedFile: readyFile,
+      mimeType
+    });
+
+    session.attachments = session.attachments
+      .filter((item) => item.id !== documentId)
+      .concat(attachment);
+    await Promise.all([
+      saveSession(sessionId, session),
+      firestoreLib.updateIngestionJob(jobId, {
+        status: "done",
+        errorMessage: null
+      })
+    ]);
+  } catch (error) {
+    console.error("[processDocumentInBackground]", error.message || error);
+    await Promise.allSettled([
+      firestoreLib.updateIngestionJob(jobId, {
+        status: "failed",
+        errorMessage: error.message || String(error)
+      }),
+      firestoreLib.saveDocument(documentId, {
+        filename: originalName,
+        displayTitle: originalName,
+        sourceType: "user_upload",
+        language: "en",
+        ingestionStatus: "failed",
+        scope: "session",
+        isScan: false,
+        geminiFileName
+      }),
+      deleteGeminiFile(geminiFileName)
+    ]);
+  }
+}
+
+
 function isAttachmentExpired(attachment, now = Date.now()) {
-  if (attachment?.strategy !== "media" || !attachment?.expirationTime) {
+  if (
+    (attachment?.strategy !== "media" && attachment?.strategy !== "longcontext") ||
+    !attachment?.expirationTime
+  ) {
     return false;
   }
 
@@ -464,7 +921,7 @@ function isAttachmentExpired(attachment, now = Date.now()) {
   return Number.isFinite(expiresAt) && expiresAt <= now;
 }
 
-async function pruneExpiredMediaAttachments(session) {
+async function pruneExpiredMediaAttachments(sessionId, session) {
   if (!session?.attachments?.length) {
     return;
   }
@@ -485,6 +942,10 @@ async function pruneExpiredMediaAttachments(session) {
   await Promise.allSettled(
     expiredMedia.map((attachment) => deleteGeminiFile(attachment.name))
   );
+
+  if (sessionId) {
+    await saveSession(sessionId, session);
+  }
 }
 
 async function runTavilySearch(query, options = {}) {
@@ -527,7 +988,7 @@ async function runTavilySearch(query, options = {}) {
 
     const data = await response.json();
     const parts = [];
-    const sources = Array.isArray(data.results)
+    const rawSources = Array.isArray(data.results)
       ? data.results.slice(0, config.MAX_SEARCH_RESULTS).map((result, index) => {
           const title = String(result.title || `Source ${index + 1}`).trim();
           const url = String(result.url || "").trim();
@@ -549,6 +1010,17 @@ async function runTavilySearch(query, options = {}) {
           };
         })
       : [];
+    const sources = rerankItems(
+      query,
+      rawSources,
+      (source) => `${source.title} ${source.url} ${source.snippet}`,
+      (source) =>
+        OFFICIAL_REFERENCE_DOMAINS.some((domain) =>
+          String(source.url || "").includes(domain)
+        )
+          ? 2
+          : 0
+    );
 
     if (data.answer) {
       parts.push(`Answer:\n${String(data.answer).trim()}`);
@@ -613,23 +1085,192 @@ async function summarizeTurns(turns) {
   }
 }
 
+function extractDocumentDate(value) {
+  const text = String(value || "");
+  const fullDateMatch = text.match(/\b(20\d{2})[._-]?(\d{2})[._-]?(\d{2})\b/);
+
+  if (fullDateMatch) {
+    return `${fullDateMatch[1]}-${fullDateMatch[2]}-${fullDateMatch[3]}`;
+  }
+
+  const monthYearMatch = text.match(/\b(\d{2})[./-](20\d{2})\b/);
+
+  if (monthYearMatch) {
+    return `${monthYearMatch[2]}-${monthYearMatch[1]}`;
+  }
+
+  return "";
+}
+
+async function buildRagContext(session, message, globalDocs) {
+  const parts = [];
+
+  if (globalDocs && globalDocs.length) {
+    const rankedGlobalDocs = rerankItems(
+      message,
+      globalDocs,
+      (doc) =>
+        `${doc.displayTitle || ""} ${doc.filename || ""} ${doc.sourceType || ""} ${doc.productFamily || ""}`
+    ).slice(0, config.MAX_RAG_CONTEXT_DOCUMENTS);
+    const lines = rankedGlobalDocs.map((doc, i) => {
+      const date = extractDocumentDate(doc.filename || doc.displayTitle || "");
+      const sourceType = doc.sourceType ? ` | Type: ${doc.sourceType}` : "";
+      return `  ${i + 1}. ${doc.displayTitle}${sourceType}${date ? ` | Date: ${date}` : ""}`;
+    });
+    parts.push(`Global knowledge base:\n${lines.join("\n")}`);
+  }
+
+  const documentAttachments = session.attachments.filter(
+    (attachment) => attachment.strategy === "document"
+  );
+
+  if (documentAttachments.length) {
+    const attachmentDocs = await Promise.all(
+      documentAttachments.map(async (attachment, index) => {
+        const doc = await firestoreLib.getDocument(attachment.id);
+        const title =
+          doc?.displayTitle ||
+          attachment.displayName ||
+          `Document ${index + 1}`;
+        const date = extractDocumentDate(
+          doc?.filename || attachment.displayName || title
+        );
+        return {
+          title,
+          filename: doc?.filename || attachment.displayName || title,
+          sourceType: doc?.sourceType || "",
+          line: `  ${index + 1}. ${title}${doc?.sourceType ? ` | Type: ${doc.sourceType}` : ""}${date ? ` | Date: ${date}` : ""}`
+        };
+      })
+    );
+    const rankedAttachmentDocs = rerankItems(
+      message,
+      attachmentDocs,
+      (doc) => `${doc.title} ${doc.filename} ${doc.sourceType}`
+    );
+    const lines = rankedAttachmentDocs.map((doc) => doc.line);
+    parts.push(`Your uploaded documents:\n${lines.join("\n")}`);
+  }
+
+  if (!parts.length) {
+    return null;
+  }
+
+  return `Indexed documents for this chat:\n${parts.join("\n\n")}`;
+}
+
+function buildBegContext(records) {
+  if (!records.length) {
+    return null;
+  }
+
+  const lines = records.slice(0, config.MAX_BEG_CONTEXT_RECORDS).map((record, index) => {
+    const details = [
+      record.heatPumpType,
+      record.refrigerant ? `Refrigerant: ${record.refrigerant}` : "",
+      Number.isFinite(record.etas35)
+        ? `ETAs 35: ${record.etas35}%`
+        : "",
+      Number.isFinite(record.etas55)
+        ? `ETAs 55: ${record.etas55}%`
+        : "",
+      `Page ${record.pageNumber}`
+    ].filter(Boolean);
+
+    return `${index + 1}. ${record.manufacturer} | ${record.modelName}\n   ${details.join(" | ")}`;
+  });
+
+  return lines.join("\n");
+}
+
+function buildBegSourceItems(records) {
+  return records.slice(0, config.MAX_BEG_CONTEXT_RECORDS).map((record) => {
+    const snippetParts = [
+      record.heatPumpType,
+      record.refrigerant ? `Refrigerant ${record.refrigerant}` : "",
+      Number.isFinite(record.etas35) ? `ETAs 35 ${record.etas35}%` : "",
+      Number.isFinite(record.etas55) ? `ETAs 55 ${record.etas55}%` : "",
+      `Page ${record.pageNumber}`
+    ].filter(Boolean);
+
+    return {
+      title: `${record.manufacturer} ${record.modelName}`.trim(),
+      url: "",
+      snippet: snippetParts.join(" | "),
+      cta: "Structured record"
+    };
+  });
+}
+
+async function searchBegRecords(message, knowledgeConfig) {
+  if (!knowledgeConfig?.begRecordCount || !knowledgeConfig?.begManufacturers?.length) {
+    return null;
+  }
+
+  const manufacturerMatch = findManufacturerMatch(
+    message,
+    knowledgeConfig.begManufacturers
+  );
+  const heatPumpType = detectHeatPumpType(message);
+  const modelQuery = extractModelQuery(message, manufacturerMatch, heatPumpType);
+  const hasSpecificModelQuery =
+    /[0-9]/.test(modelQuery) || modelQuery.split(" ").filter(Boolean).length >= 2;
+
+  if (
+    (!manufacturerMatch && !hasSpecificModelQuery) ||
+    (manufacturerMatch && !hasSpecificModelQuery && !heatPumpType)
+  ) {
+    return null;
+  }
+
+  const candidateRecords = await firestoreLib.queryBegRecords({
+    manufacturerNormalized: manufacturerMatch?.manufacturerNormalized || "",
+    heatPumpType,
+    begEligible: true
+  });
+
+  if (!candidateRecords.length) {
+    return null;
+  }
+
+  const rankedRecords = rerankItems(
+    `${manufacturerMatch?.displayName || ""} ${modelQuery} ${heatPumpType}`.trim(),
+    candidateRecords,
+    (record) =>
+      `${record.manufacturer} ${record.modelName} ${record.heatPumpType} ${record.refrigerant || ""}`,
+    (record) => (record.begEligible ? 2 : 0)
+  ).slice(0, config.MAX_BEG_CONTEXT_RECORDS);
+
+  if (!rankedRecords.length) {
+    return null;
+  }
+
+  return {
+    context: buildBegContext(rankedRecords),
+    sources: buildBegSourceItems(rankedRecords)
+  };
+}
+
 app.get("/api/attachments", async (req, res) => {
   const sessionId =
     typeof req.query?.sessionId === "string" ? req.query.sessionId.trim() : "";
+  const forceRefresh = String(req.query?.refresh || "") === "1";
 
   if (!sessionId) {
     return res.json({ attachments: [] });
   }
 
-  const session = sessions.get(sessionId);
-  await pruneExpiredMediaAttachments(session);
+  const session = await getSession(sessionId, { forceRefresh });
+  await pruneExpiredMediaAttachments(sessionId, session);
   return res.json({ attachments: session?.attachments || [] });
 });
 
 app.post("/api/upload", (req, res) => {
   upload.single("file")(req, res, async (error) => {
     const tempFilePath = req.file?.path;
-    let uploadedMediaFileName = "";
+    let convertedFilePath = "";
+    let uploadedGeminiFileName = "";
+    let documentQueued = false;
 
     try {
       if (error instanceof multer.MulterError) {
@@ -661,8 +1302,8 @@ app.post("/api/upload", (req, res) => {
         return res.status(429).json({ error: "upload rate limit exceeded" });
       }
 
-      const session = getSession(sessionId);
-      await pruneExpiredMediaAttachments(session);
+      const session = await getSession(sessionId);
+      await pruneExpiredMediaAttachments(sessionId, session);
 
       if (session.attachments.length >= config.MAX_SESSION_FILES) {
         return res.status(400).json({
@@ -671,6 +1312,8 @@ app.post("/api/upload", (req, res) => {
       }
 
       const uploadDescriptor = resolveUploadDescriptor(req.file);
+      let uploadMimeType = uploadDescriptor?.mimeType || "";
+      let uploadFilePath = req.file.path;
 
       if (!uploadDescriptor) {
         return res.status(400).json({
@@ -679,44 +1322,93 @@ app.post("/api/upload", (req, res) => {
         });
       }
 
+      if (isSpreadsheetMimeType(uploadDescriptor.mimeType)) {
+        const convertedFile = await convertSpreadsheetToTextFile(
+          req.file
+        );
+        convertedFilePath = convertedFile.path;
+        uploadFilePath = convertedFile.path;
+        uploadMimeType = convertedFile.mimeType;
+      }
+
+      const uploadedFile = await genAI.files.upload({
+        file: uploadFilePath,
+        config: {
+          displayName: req.file.originalname,
+          mimeType: uploadMimeType
+        }
+      });
+      uploadedGeminiFileName = uploadedFile.name || "";
       let attachment;
 
-      if (uploadDescriptor.strategy === "document") {
-        const storeName = await ensureFileSearchStore(session, sessionId);
-        let operation = await genAI.fileSearchStores.uploadToFileSearchStore({
-          file: req.file.path,
-          fileSearchStoreName: storeName,
-          config: {
-            displayName: req.file.originalname,
-            mimeType: uploadDescriptor.mimeType
-          }
+      if (
+        uploadDescriptor.strategy === "document" &&
+        !supportsInlineLongContextMimeType(uploadMimeType)
+      ) {
+        const jobId = randomUUID();
+        const documentId = randomUUID();
+        documentQueued = true;
+
+        await Promise.all([
+          firestoreLib.createIngestionJob(jobId, documentId, sessionId),
+          firestoreLib.saveDocument(documentId, {
+            filename: req.file.originalname,
+            displayTitle: req.file.originalname,
+            sourceType: "user_upload",
+            language: "en",
+            ingestionStatus: "pending",
+            scope: "session",
+            isScan: false,
+            geminiFileName: uploadedGeminiFileName
+          })
+        ]);
+
+        void processDocumentInBackground({
+          jobId,
+          documentId,
+          sessionId,
+          geminiFileName: uploadedGeminiFileName,
+          originalName: req.file.originalname,
+          mimeType: uploadMimeType,
+          sizeBytes: req.file.size
         });
 
-        operation = await waitForOperationDone(operation);
-
-        const documentName = operation.response?.documentName;
-
-        if (!documentName) {
-          throw new Error("Document indexing completed without a document name");
-        }
-
-        const document = await waitForDocumentReady(documentName);
-        attachment = serializeDocument(document);
+        return res.json({
+          ok: true,
+          jobId,
+          documentId
+        });
       } else {
-        const uploadedFile = await genAI.files.upload({
-          file: req.file.path,
-          config: {
-            displayName: req.file.originalname,
-            mimeType: uploadDescriptor.mimeType
-          }
-        });
-        uploadedMediaFileName = uploadedFile.name || "";
-
         const readyFile = await waitForMediaFileReady(uploadedFile.name);
-        attachment = serializeMediaFile(readyFile, req.file.originalname);
+
+        if (uploadDescriptor.strategy === "document") {
+          attachment = {
+            id: String(readyFile.name || "").replace(/^files\//, ""),
+            name: String(readyFile.name || "").trim(),
+            displayName: req.file.originalname,
+            mimeType: uploadMimeType,
+            sizeBytes: Number(readyFile.sizeBytes || req.file.size || 0),
+            expirationTime: String(readyFile.expirationTime || "").trim(),
+            uri: String(readyFile.uri || "").trim(),
+            strategy: "longcontext"
+          };
+        } else if (uploadDescriptor.strategy === "media") {
+          attachment = serializeMediaFile(readyFile, req.file.originalname);
+        }
+      }
+
+      if (
+        uploadDescriptor.strategy === "document" &&
+        supportsInlineLongContextMimeType(uploadMimeType)
+      ) {
+        attachment = {
+          ...attachment,
+          strategy: "longcontext"
+        };
       }
 
       session.attachments.push(attachment);
+      await saveSession(sessionId, session);
 
       return res.json({
         ok: true,
@@ -724,8 +1416,8 @@ app.post("/api/upload", (req, res) => {
         file: attachment
       });
     } catch (uploadError) {
-      if (uploadedMediaFileName) {
-        await deleteGeminiFile(uploadedMediaFileName);
+      if (uploadedGeminiFileName && !documentQueued) {
+        await deleteGeminiFile(uploadedGeminiFileName);
       }
 
       console.error("[/api/upload]", uploadError.message || uploadError);
@@ -734,10 +1426,28 @@ app.post("/api/upload", (req, res) => {
           "I couldn’t upload that file just now. Please try again with a supported file."
       });
     } finally {
+      if (convertedFilePath) {
+        await fs.unlink(convertedFilePath).catch(() => {});
+      }
+
       if (tempFilePath) {
         await fs.unlink(tempFilePath).catch(() => {});
       }
     }
+  });
+});
+
+app.get("/api/ingest/status/:jobId", async (req, res) => {
+  const job = await firestoreLib.getIngestionJob(req.params.jobId);
+
+  if (!job) {
+    return res.status(404).json({ error: "Job not found" });
+  }
+
+  res.json({
+    status: job.status,
+    documentId: job.documentId,
+    errorMessage: job.errorMessage || null
   });
 });
 
@@ -755,13 +1465,18 @@ app.delete("/api/attachments/:attachmentId", async (req, res) => {
       .json({ error: "sessionId and attachmentId are required" });
   }
 
-  const session = sessions.get(sessionId);
+  const cachedSession = sessionCache.get(sessionId);
+  const storedSession = cachedSession || await firestoreLib.getSession(sessionId);
+  const session = cachedSession ||
+    (storedSession ? normalizeSession(storedSession) : null);
 
   if (!session) {
     return res.json({ ok: true, attachments: [] });
   }
 
-  await pruneExpiredMediaAttachments(session);
+  sessionCache.set(sessionId, session);
+  sessionCacheTouchedAt.set(sessionId, Date.now());
+  await pruneExpiredMediaAttachments(sessionId, session);
 
   const attachmentIndex = session.attachments.findIndex(
     (attachment) => attachment.id === attachmentId
@@ -775,15 +1490,25 @@ app.delete("/api/attachments/:attachmentId", async (req, res) => {
 
   try {
     if (attachment.strategy === "document") {
-      await genAI.fileSearchStores.documents.delete({
-        name: attachment.name,
-        config: { force: true }
-      });
+      const documentMeta = await firestoreLib.getDocument(attachment.id).catch(() => null);
+      const cleanupResults = await Promise.all([
+        deleteFileSearchDocument(attachment.name),
+        documentMeta?.geminiFileName
+          ? deleteGeminiFile(documentMeta.geminiFileName)
+          : Promise.resolve(true),
+        documentMeta?.transcriptionFileName
+          ? deleteGeminiFile(documentMeta.transcriptionFileName)
+          : Promise.resolve(true)
+      ]);
+
+      if (cleanupResults.some((result) => result === false)) {
+        throw new Error("Could not delete the indexed document");
+      }
     } else {
       const deleted = await deleteGeminiFile(attachment.name);
 
       if (!deleted) {
-        throw new Error("Could not delete the uploaded media file");
+        throw new Error("Could not delete the uploaded file");
       }
     }
   } catch (deleteError) {
@@ -794,7 +1519,6 @@ app.delete("/api/attachments/:attachmentId", async (req, res) => {
   }
 
   session.attachments.splice(attachmentIndex, 1);
-
   if (
     attachment.strategy === "document" &&
     !session.attachments.some((item) => item.strategy === "document")
@@ -805,6 +1529,7 @@ app.delete("/api/attachments/:attachmentId", async (req, res) => {
       session.fileSearchStoreName = null;
     }
   }
+  await saveSession(sessionId, session);
 
   return res.json({ ok: true, attachments: session.attachments });
 });
@@ -847,8 +1572,8 @@ app.post("/api/chat", async (req, res) => {
   });
 
   try {
-    const session = getSession(sessionId);
-    await pruneExpiredMediaAttachments(session);
+    const session = await getSession(sessionId);
+    await pruneExpiredMediaAttachments(sessionId, session);
 
     if (session.turns.length >= config.MAX_HISTORY_TURNS) {
       const splitIndex = Math.max(
@@ -867,20 +1592,47 @@ app.post("/api/chat", async (req, res) => {
             ? `${session.summary}\n${newSummary}`
             : newSummary;
           session.turns = toKeep;
+          await saveSession(sessionId, session);
         }
       }
     }
 
-    const shouldSearch = forceWebSearch || needsWebSearch(message);
+    const sessionHasInlineDocuments = session.attachments.some(
+      (attachment) => attachment.strategy === "longcontext"
+    );
+    const sessionHasIndexedDocuments =
+      !!session.fileSearchStoreName &&
+      session.attachments.some((attachment) => attachment.strategy === "document");
+    const useOnlyUserDocuments =
+      (sessionHasInlineDocuments || sessionHasIndexedDocuments) &&
+      isFileFocusedQuestion(message);
+    const knowledgeConfig = await getGlobalStoreConfig();
+    const candidateStoreNames = [...new Set(
+      [
+        sessionHasIndexedDocuments ? session.fileSearchStoreName : null,
+        useOnlyUserDocuments ? null : knowledgeConfig.storeName
+      ].filter(Boolean)
+    )];
+    const retrievalPlan = classifyRetrieval(message, {
+      forceWebSearch,
+      hasDocumentStores: candidateStoreNames.length > 0,
+      hasUserDocuments: sessionHasIndexedDocuments,
+      hasBegRecords: knowledgeConfig.begRecordCount > 0
+    });
+    const shouldSearch = retrievalPlan.wantsWeb;
     const webSearchRequest = shouldSearch
-      ? buildWebSearchRequest(message, config.OFFICIAL_WEB_DOMAINS)
+      ? buildWebSearchRequest(message, [
+          ...config.OFFICIAL_WEB_DOMAINS,
+          ...OFFICIAL_REFERENCE_DOMAINS
+        ])
       : null;
-
+    const hasIndexedDocuments =
+      retrievalPlan.wantsDocuments && candidateStoreNames.length > 0;
     if (shouldSearch) {
       send({ type: "status", content: "searching" });
     }
 
-    const [webContext] = await Promise.all([
+    const [webContext, ragContext, begLookup] = await Promise.all([
       webSearchRequest
         ? searchWeb(webSearchRequest.query, {
             topic: webSearchRequest.topic,
@@ -890,15 +1642,23 @@ app.post("/api/chat", async (req, res) => {
                 : null,
             includeDomains: webSearchRequest.includeDomains
           })
+        : Promise.resolve(null),
+      hasIndexedDocuments
+        ? buildRagContext(
+            session,
+            message,
+            useOnlyUserDocuments ? [] : knowledgeConfig.documents
+          )
+        : Promise.resolve(null),
+      retrievalPlan.wantsBegRecords
+        ? searchBegRecords(message, knowledgeConfig)
         : Promise.resolve(null)
-      // Phase 2: ragSearch goes here
     ]);
-
+    const fileSearchStoreNames = hasIndexedDocuments ? candidateStoreNames : [];
     const normalizedWebContext = webContext?.context || null;
     const webSources = webContext?.sources || [];
-    const hasIndexedDocuments =
-      !!session.fileSearchStoreName &&
-      session.attachments.some((attachment) => attachment.strategy === "document");
+    const begContext = begLookup?.context || null;
+    const begSources = begLookup?.sources || [];
     const mediaParts = buildMediaAttachmentParts(session.attachments);
 
     if (shouldSearch && (normalizedWebContext || webSources.length)) {
@@ -909,7 +1669,10 @@ app.post("/api/chat", async (req, res) => {
       history: session.turns,
       summary: session.summary,
       webContext: normalizedWebContext,
-      userMessage: message
+      ragContext,
+      begContext,
+      userMessage: message,
+      mode: retrievalPlan.mode
     });
 
     if (clientClosed) {
@@ -918,7 +1681,8 @@ app.post("/api/chat", async (req, res) => {
 
     send({
       type: "status",
-      content: hasIndexedDocuments ? "retrieving" : "responding"
+      content:
+        hasIndexedDocuments || begContext ? "retrieving" : "responding"
     });
 
     const responseStream = await genAI.models.generateContentStream({
@@ -933,7 +1697,7 @@ app.post("/api/chat", async (req, res) => {
               tools: [
                 {
                   fileSearch: {
-                    fileSearchStoreNames: [session.fileSearchStoreName],
+                    fileSearchStoreNames,
                     topK: config.FILE_SEARCH_TOP_K
                   }
                 }
@@ -970,6 +1734,7 @@ app.post("/api/chat", async (req, res) => {
 
     session.turns.push({ role: "user", content: message });
     session.turns.push({ role: "assistant", content: fullResponse.trim() });
+    await saveSession(sessionId, session);
 
     const documentSources = extractDocumentSources(lastGroundingMetadata);
 
@@ -979,6 +1744,16 @@ app.post("/api/chat", async (req, res) => {
         content: {
           label: "Document sources",
           items: documentSources
+        }
+      });
+    }
+
+    if (begSources.length) {
+      send({
+        type: "sources",
+        content: {
+          label: "BEG structured records",
+          items: begSources
         }
       });
     }
@@ -1006,24 +1781,46 @@ app.post("/api/reset", async (req, res) => {
   const sessionId =
     typeof req.body?.sessionId === "string" ? req.body.sessionId.trim() : "";
 
-  if (sessionId) {
-    const session = sessions.get(sessionId);
+    if (sessionId) {
+      const cachedSession = sessionCache.get(sessionId);
+      const storedSession = cachedSession || await firestoreLib.getSession(sessionId);
+    const session = cachedSession ||
+      (storedSession ? normalizeSession(storedSession) : null);
 
-    if (session?.attachments?.length) {
-      await Promise.allSettled(
-        session.attachments
-          .filter((attachment) => attachment.strategy === "media")
-          .map((attachment) => deleteGeminiFile(attachment.name))
-      );
-    }
+      if (session?.attachments?.length) {
+        const documentCleanupTargets = await Promise.all(
+          session.attachments
+            .filter((a) => a.strategy === "document")
+            .map(async (a) => ({
+              attachment: a,
+              documentMeta: await firestoreLib.getDocument(a.id).catch(() => null)
+            }))
+        );
 
-    if (session?.fileSearchStoreName) {
-      await deleteFileSearchStore(session.fileSearchStoreName);
-    }
+        await Promise.allSettled([
+          ...session.attachments
+            .filter((a) => a.strategy === "media" || a.strategy === "longcontext")
+            .map((a) => deleteGeminiFile(a.name)),
+          ...documentCleanupTargets.flatMap(({ attachment, documentMeta }) => [
+            deleteFileSearchDocument(attachment.name),
+            documentMeta?.geminiFileName
+              ? deleteGeminiFile(documentMeta.geminiFileName)
+              : Promise.resolve(true),
+            documentMeta?.transcriptionFileName
+              ? deleteGeminiFile(documentMeta.transcriptionFileName)
+              : Promise.resolve(true)
+          ]),
+          session.fileSearchStoreName
+            ? deleteFileSearchStore(session.fileSearchStoreName)
+            : Promise.resolve(true)
+        ]);
+      }
 
-    sessions.delete(sessionId);
-    rateLimits.delete(sessionId);
-    uploadRateLimits.delete(sessionId);
+    sessionCache.delete(sessionId);
+    sessionCacheTouchedAt.delete(sessionId);
+    await firestoreLib.deleteSession(sessionId);
+    rateLimitBuckets.delete(sessionId);
+    uploadRateLimitBuckets.delete(sessionId);
   }
 
   res.json({ ok: true });
@@ -1032,7 +1829,7 @@ app.post("/api/reset", async (req, res) => {
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    sessions: sessions.size,
+    sessions: sessionCache.size,
     model: config.GEMINI_MODEL,
     fileSearchModel: config.GEMINI_FILE_SEARCH_MODEL
   });

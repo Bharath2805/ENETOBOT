@@ -6,14 +6,19 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "ingest:global": "node scripts/ingest-global-corpus.js",
+    "ingest:beg": "node scripts/extract-beg-records.js"
   },
   "dependencies": {
+    "@google-cloud/firestore": "^7.11.6",
     "@google/genai": "^1.47.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
-    "multer": "^2.1.1"
+    "google-auth-library": "^10.6.2",
+    "multer": "^2.1.1",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"
