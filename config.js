@@ -18,8 +18,8 @@ module.exports = {
   UPLOAD_POLL_ATTEMPTS: 60,
   UPLOAD_RATE_LIMIT_RPM: 6,
   RATE_LIMIT_RPM: 15,
-  OFFICIAL_WEB_DOMAINS: ["docs.eneto.com", "eneto.com"],
-  DOCS_URL: "https://docs.eneto.com",
+  OFFICIAL_WEB_DOMAINS: ["eneto.com"],
+  DOCS_URL: "https://eneto.com",
   FALLBACK_MESSAGE:
-    "I hit a temporary issue. Please try again in a moment, or check https://docs.eneto.com."
+    "I hit a temporary issue. Please try again in a moment, or visit https://eneto.com."
 };
