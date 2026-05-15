@@ -1,5 +1,5 @@
 const SESSION_KEY = "chatbot-session-id";
-const WEB_SEARCH_TOGGLE_KEY = "chatbot-web-search-enabled";
+const WEB_SEARCH_MODE_KEY = "chatbot-web-search-mode";
 const MAX_TEXTAREA_HEIGHT = 140;
 const MAX_SESSION_FILES = 20;
 const INGEST_POLL_INTERVAL_MS = 1500;
@@ -26,14 +26,22 @@ const fileInputEl = document.getElementById("file-input");
 const webSearchToggleEl = document.getElementById("web-search-toggle");
 const webSearchStatusEl = document.getElementById("web-search-status");
 const resetBtn = document.getElementById("reset-btn");
-const starterRowEl = document.getElementById("starter-row");
 const attachmentRowEl = document.getElementById("attachment-row");
 const inputHintEl = document.getElementById("input-hint");
 const ingestBannerEl = document.getElementById("ingest-banner");
+const recentChatsEl = document.getElementById("recent-chats");
+const chatTitleEl = document.getElementById("chat-title");
+const chatTopbarEl = document.getElementById("chat-topbar");
+const sidebarEl = document.getElementById("sidebar");
+const sidebarToggleEl = document.getElementById("sidebar-toggle");
+const mobileSidebarFabEl = document.getElementById("mobile-sidebar-fab");
+const sidebarOverlayEl = document.getElementById("sidebar-overlay");
+const chatMenuBtn = document.getElementById("chat-menu-btn");
+const chatMenuPopover = document.getElementById("chat-menu-popover");
 
 let sessionId = getOrCreateSessionId();
 let attachments = [];
-let isWebSearchEnabled = getStoredWebSearchPreference();
+let webSearchMode = getStoredWebSearchMode();
 let isStreaming = false;
 let isUploading = false;
 let hintOverride = "";
@@ -56,8 +64,15 @@ function getOrCreateSessionId() {
   return newId;
 }
 
-function getStoredWebSearchPreference() {
-  return localStorage.getItem(WEB_SEARCH_TOGGLE_KEY) === "true";
+function getStoredWebSearchMode() {
+  const storedMode = localStorage.getItem(WEB_SEARCH_MODE_KEY);
+  const legacyEnabled = localStorage.getItem("chatbot-web-search-enabled") === "true";
+
+  if (["auto", "always", "off"].includes(storedMode)) {
+    return storedMode;
+  }
+
+  return legacyEnabled ? "always" : "auto";
 }
 
 function getTimeLabel() {
@@ -65,6 +80,40 @@ function getTimeLabel() {
     hour: "numeric",
     minute: "2-digit"
   });
+}
+
+function getWebSearchModeCopy() {
+  if (webSearchMode === "always") {
+    return {
+      label: "On",
+      shortLabel: "On",
+      title: "Web search: Always on — uses live web sources for every message"
+    };
+  }
+
+  if (webSearchMode === "off") {
+    return {
+      label: "Off",
+      shortLabel: "Off",
+      title: "Web search: Off — disables automatic and forced web lookup"
+    };
+  }
+
+  return {
+    label: "Auto",
+    shortLabel: "A",
+    title: "Web search: Auto — uses smart triggering for current topics"
+  };
+}
+
+function cycleWebSearchMode() {
+  webSearchMode = webSearchMode === "auto"
+    ? "always"
+    : webSearchMode === "always"
+      ? "off"
+      : "auto";
+  localStorage.setItem(WEB_SEARCH_MODE_KEY, webSearchMode);
+  updateComposerState();
 }
 
 function updateComposerState() {
@@ -79,13 +128,13 @@ function updateComposerState() {
   fileBtn.disabled =
     isStreaming || isUploading || totalAttachmentCount >= MAX_SESSION_FILES;
   webSearchToggleEl.disabled = isBlocked;
-  webSearchToggleEl.setAttribute(
-    "aria-checked",
-    isWebSearchEnabled ? "true" : "false"
-  );
-  webSearchToggleEl.classList.toggle("is-on", isWebSearchEnabled);
-  webSearchStatusEl.textContent = isWebSearchEnabled ? "Always on" : "Off";
-  webSearchStatusEl.classList.toggle("is-on", isWebSearchEnabled);
+  webSearchToggleEl.dataset.mode = webSearchMode;
+  webSearchToggleEl.classList.toggle("is-on", webSearchMode === "always");
+  webSearchToggleEl.classList.toggle("is-off", webSearchMode === "off");
+  const modeCopy = getWebSearchModeCopy();
+  webSearchToggleEl.title = modeCopy.title;
+  webSearchToggleEl.setAttribute("aria-label", modeCopy.title);
+  webSearchStatusEl.textContent = modeCopy.shortLabel;
 
   if (isIndexing || isUploading) {
     inputHintEl.textContent = "Chat is locked while your file is being prepared.";
@@ -100,23 +149,9 @@ function updateComposerState() {
     return;
   }
 
-  const parts = [
-    "Enter to send",
-    "Shift+Enter for new line",
-    'Add "search web" for a live lookup'
-  ];
-
-  if (isWebSearchEnabled) {
-    parts.push("Web search is on for every message");
-  } else if (totalAttachmentCount) {
-    parts.push(
-      `${totalAttachmentCount} attached file${totalAttachmentCount === 1 ? "" : "s"} in this chat`
-    );
-  } else {
-    parts.push("Attach PDFs, Office docs, text files, or images");
-  }
-
-  inputHintEl.textContent = parts.join(" · ");
+  inputHintEl.textContent = totalAttachmentCount
+    ? `${totalAttachmentCount} attached file${totalAttachmentCount === 1 ? "" : "s"} in this chat`
+    : "";
 }
 
 function setHintOverride(message) {
@@ -156,8 +191,34 @@ function escapeHtml(text) {
     .replace(/>/g, "&gt;");
 }
 
-function formatInline(text) {
-  return escapeHtml(text)
+function getBubbleCitations(bubbleEl) {
+  try {
+    const citations = JSON.parse(bubbleEl?.dataset?.citations || "[]");
+    return Array.isArray(citations) ? citations : [];
+  } catch (_error) {
+    return [];
+  }
+}
+
+function getCitationByNumber(citations, number) {
+  return citations[number - 1] || null;
+}
+
+function formatCitationMarkers(html, citations) {
+  return html.replace(/\[(\d+)\]/g, (match, rawNumber) => {
+    const number = Number(rawNumber);
+    const citation = getCitationByNumber(citations, number);
+
+    if (!citation) {
+      return "";
+    }
+
+    return `<button class="citation-marker" type="button" data-cite-number="${number}" data-cite-id="${escapeHtml(citation.id)}" aria-label="Open citation ${number}">[${number}]</button>`;
+  });
+}
+
+function formatInline(text, citations = []) {
+  const html = escapeHtml(text)
     .replace(
       /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
       '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
@@ -165,9 +226,11 @@ function formatInline(text) {
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/\*(.+?)\*/g, "<em>$1</em>");
+
+  return formatCitationMarkers(html, citations);
 }
 
-function formatText(text) {
+function formatText(text, citations = []) {
   const lines = String(text || "").split("\n");
   const htmlParts = [];
   let paragraphLines = [];
@@ -178,7 +241,9 @@ function formatText(text) {
       return;
     }
 
-    htmlParts.push(`<p>${paragraphLines.map(formatInline).join("<br>")}</p>`);
+    htmlParts.push(
+      `<p>${paragraphLines.map((line) => formatInline(line, citations)).join("<br>")}</p>`
+    );
     paragraphLines = [];
   }
 
@@ -203,21 +268,21 @@ function formatText(text) {
     if (/^###\s+/.test(line)) {
       flushParagraph();
       closeList();
-      htmlParts.push(`<h3>${formatInline(line.replace(/^###\s+/, ""))}</h3>`);
+      htmlParts.push(`<h3>${formatInline(line.replace(/^###\s+/, ""), citations)}</h3>`);
       continue;
     }
 
     if (/^##\s+/.test(line)) {
       flushParagraph();
       closeList();
-      htmlParts.push(`<h2>${formatInline(line.replace(/^##\s+/, ""))}</h2>`);
+      htmlParts.push(`<h2>${formatInline(line.replace(/^##\s+/, ""), citations)}</h2>`);
       continue;
     }
 
     if (/^#\s+/.test(line)) {
       flushParagraph();
       closeList();
-      htmlParts.push(`<h1>${formatInline(line.replace(/^#\s+/, ""))}</h1>`);
+      htmlParts.push(`<h1>${formatInline(line.replace(/^#\s+/, ""), citations)}</h1>`);
       continue;
     }
 
@@ -232,7 +297,7 @@ function formatText(text) {
         listType = "ul";
       }
 
-      htmlParts.push(`<li>${formatInline(unorderedMatch[1])}</li>`);
+      htmlParts.push(`<li>${formatInline(unorderedMatch[1], citations)}</li>`);
       continue;
     }
 
@@ -247,7 +312,7 @@ function formatText(text) {
         listType = "ol";
       }
 
-      htmlParts.push(`<li>${formatInline(orderedMatch[1])}</li>`);
+      htmlParts.push(`<li>${formatInline(orderedMatch[1], citations)}</li>`);
       continue;
     }
 
@@ -276,25 +341,42 @@ function formatBytes(value) {
 }
 
 function getPendingAttachmentStatus(attachment) {
+  const status = getAttachmentIngestionStatus(attachment);
+
+  if (status === "failed") {
+    return "Failed — try re-uploading";
+  }
+
+  if (status === "done") {
+    return "Ready";
+  }
+
+  return "Processing…";
+}
+
+function getAttachmentIngestionStatus(attachment) {
   if (attachment.errorMessage) {
-    return attachment.errorMessage;
+    return "failed";
   }
 
-  const startedAt = Number(attachment.startedAt || 0);
-  const elapsedMs = startedAt ? Date.now() - startedAt : 0;
-  const lowerName = String(attachment.displayName || "").toLowerCase();
-  const isLikelyScan =
-    lowerName.includes("playbook") || lowerName.includes("onboarding");
+  const status = String(
+    attachment.ingestion_status || attachment.ingestionStatus || ""
+  ).trim();
 
-  if (isLikelyScan && elapsedMs >= 60_000) {
-    return "Running OCR and indexing. Scanned PDFs can take 1-3 minutes.";
+  if (["queued", "processing", "done", "failed"].includes(status)) {
+    return status;
   }
 
-  if (elapsedMs >= 20_000) {
-    return "Indexing document for this chat...";
-  }
+  return attachment.isPending ? "processing" : "done";
+}
 
-  return "Processing...";
+function getAttachmentIngestionError(attachment) {
+  return String(
+    attachment.ingestion_error ||
+      attachment.ingestionError ||
+      attachment.errorMessage ||
+      ""
+  ).trim();
 }
 
 function getPendingAttachmentItems() {
@@ -303,7 +385,9 @@ function getPendingAttachmentItems() {
 
 function hasActivePendingJobs() {
   for (const job of pendingIngestionJobs.values()) {
-    if (!job.errorMessage) {
+    const status = getAttachmentIngestionStatus(job);
+
+    if (status === "queued" || status === "processing") {
       return true;
     }
   }
@@ -313,7 +397,9 @@ function hasActivePendingJobs() {
 
 function getActivePendingJob() {
   for (const job of pendingIngestionJobs.values()) {
-    if (!job.errorMessage) {
+    const status = getAttachmentIngestionStatus(job);
+
+    if (status === "queued" || status === "processing") {
       return job;
     }
   }
@@ -449,7 +535,7 @@ function appendBubble(role, text) {
 
   const content = document.createElement("div");
   content.className = "bubble-content";
-  content.innerHTML = text ? formatText(text) : "";
+  content.innerHTML = text ? formatText(text, []) : "";
 
   const sources = document.createElement("div");
   sources.className = "bubble-sources";
@@ -465,6 +551,7 @@ function appendBubble(role, text) {
   bubble.appendChild(sources);
   wrap.appendChild(bubble);
   messagesEl.appendChild(wrap);
+  updateChatChrome();
   return bubble;
 }
 
@@ -492,7 +579,10 @@ function appendTextToBubble(bubbleEl, text) {
   // cursor lives outside contentEl as a sibling — innerHTML update does not
   // displace it, so no re-insertion needed.
   const { contentEl } = getBubbleParts(bubbleEl);
-  contentEl.innerHTML = formatText(bubbleEl.dataset.raw);
+  contentEl.innerHTML = formatText(
+    bubbleEl.dataset.raw,
+    getBubbleCitations(bubbleEl)
+  );
 }
 
 function getDomainLabel(url) {
@@ -501,6 +591,184 @@ function getDomainLabel(url) {
   } catch (_error) {
     return "Source";
   }
+}
+
+function parseSourceDate(value) {
+  const text = String(value || "").trim();
+
+  if (!text) {
+    return null;
+  }
+
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function buildBegFreshnessChip(items) {
+  const begItems = items.filter((item) => item.metadataType === "beg-record");
+
+  if (!begItems.length) {
+    return null;
+  }
+
+  const sourceNames = [
+    ...new Set(
+      begItems
+        .map((item) => String(item.source || "").trim())
+        .filter(Boolean)
+    )
+  ];
+  const sourceLabel = sourceNames.length === 1
+    ? sourceNames[0]
+    : sourceNames.length > 1
+      ? "Multiple BEG sources"
+      : "BEG source unknown";
+  const dates = begItems.map((item) =>
+    parseSourceDate(item.last_updated || item.lastUpdated)
+  );
+  const hasUnknownDate = dates.some((date) => !date);
+  const oldestDate = hasUnknownDate
+    ? null
+    : dates.reduce((oldest, date) => (!oldest || date < oldest ? date : oldest), null);
+  const dateLabel = oldestDate ? oldestDate.toISOString().slice(0, 10) : "unknown";
+  const daysOld = oldestDate
+    ? (Date.now() - oldestDate.getTime()) / (1000 * 60 * 60 * 24)
+    : Infinity;
+  const isStale = !oldestDate || daysOld > 90;
+  const chip = document.createElement("div");
+  chip.className = `beg-freshness-chip${isStale ? " is-stale" : " is-current"}`;
+  chip.title = "This answer used Eneto's structured BEG funding records.";
+  chip.textContent = isStale
+    ? `${sourceLabel} · ${dateLabel} · BEG data may be outdated — verify with BAFA/KfW.`
+    : `${sourceLabel} · Last updated ${dateLabel}`;
+
+  return chip;
+}
+
+function getCitationLabel(citation, number) {
+  const page = citation.page ? ` p. ${citation.page}` : "";
+  return `[${number}] ${citation.title || "Source"}${page}`;
+}
+
+function openCitation(citation) {
+  if (!citation) {
+    return;
+  }
+
+  if ((citation.type === "web" || citation.type === "document") && citation.url) {
+    window.open(citation.url, "_blank", "noopener,noreferrer");
+    return;
+  }
+
+  showCitationPanel(citation);
+}
+
+function showCitationPanel(citation) {
+  let overlay = document.querySelector(".citation-panel-overlay");
+
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.className = "citation-panel-overlay";
+    overlay.innerHTML = `
+      <aside class="citation-panel" role="dialog" aria-modal="true" aria-label="Citation details">
+        <button class="citation-panel-close" type="button" aria-label="Close citation details">×</button>
+        <div class="citation-panel-body"></div>
+      </aside>
+    `;
+    document.body.appendChild(overlay);
+    overlay.addEventListener("click", (event) => {
+      if (
+        event.target === overlay ||
+        event.target.closest(".citation-panel-close")
+      ) {
+        overlay.remove();
+      }
+    });
+  }
+
+  const body = overlay.querySelector(".citation-panel-body");
+  const sourceName = citation.source || citation.title || "Source";
+  const updated = citation.last_updated || citation.retrieved_at || "unknown";
+  const page = citation.page ? `Page ${citation.page}` : "Page unknown";
+  const typeLabel = citation.type === "beg_record"
+    ? "BEG structured record"
+    : citation.type === "document"
+      ? "Document citation"
+      : "Web citation";
+  const snippet = citation.snippet || "No excerpt available.";
+
+  body.innerHTML = `
+    <span class="citation-panel-type">${formatInline(typeLabel)}</span>
+    <h3>${formatInline(citation.title || "Citation")}</h3>
+    <p class="citation-panel-meta">${formatInline(sourceName)} · ${formatInline(page)} · ${formatInline(updated)}</p>
+    <p class="citation-panel-snippet">${formatInline(snippet)}</p>
+    <button class="citation-copy" type="button">Copy citation</button>
+  `;
+
+  const copyBtn = body.querySelector(".citation-copy");
+  copyBtn.addEventListener("click", async () => {
+    const copyText = `${citation.title || "Citation"}\n${page}\n${snippet}`;
+    await navigator.clipboard?.writeText(copyText).catch(() => {});
+    copyBtn.textContent = "Copied";
+    setTimeout(() => {
+      copyBtn.textContent = "Copy citation";
+    }, 1500);
+  });
+}
+
+function renderCitationRow(bubbleEl) {
+  const citations = getBubbleCitations(bubbleEl);
+  const { sourcesEl } = getBubbleParts(bubbleEl);
+
+  if (!sourcesEl) {
+    return;
+  }
+
+  sourcesEl.querySelector(".citation-row")?.remove();
+
+  if (!citations.length) {
+    return;
+  }
+
+  const row = document.createElement("div");
+  row.className = "citation-row";
+
+  for (const [index, citation] of citations.entries()) {
+    const number = index + 1;
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = `citation-source-chip is-${citation.type}`;
+    chip.dataset.citeNumber = String(number);
+    chip.textContent = getCitationLabel(citation, number);
+    chip.addEventListener("mouseenter", () => {
+      bubbleEl
+        .querySelectorAll(`.citation-marker[data-cite-number="${number}"]`)
+        .forEach((marker) => marker.classList.add("is-highlighted"));
+    });
+    chip.addEventListener("mouseleave", () => {
+      bubbleEl
+        .querySelectorAll(`.citation-marker[data-cite-number="${number}"]`)
+        .forEach((marker) => marker.classList.remove("is-highlighted"));
+    });
+    chip.addEventListener("click", () => openCitation(citation));
+    row.appendChild(chip);
+  }
+
+  sourcesEl.prepend(row);
+}
+
+function applyCitationsToBubble(bubbleEl, citations) {
+  bubbleEl.dataset.citations = JSON.stringify(Array.isArray(citations) ? citations : []);
+  const { contentEl } = getBubbleParts(bubbleEl);
+
+  if (contentEl) {
+    contentEl.innerHTML = formatText(
+      bubbleEl.dataset.raw || "",
+      getBubbleCitations(bubbleEl)
+    );
+  }
+
+  renderCitationRow(bubbleEl);
 }
 
 function appendSourcesToBubble(bubbleEl, sources) {
@@ -517,6 +785,12 @@ function appendSourcesToBubble(bubbleEl, sources) {
     return;
   }
 
+  const begChip = buildBegFreshnessChip(items);
+
+  if (begChip) {
+    sourcesEl.appendChild(begChip);
+  }
+
   const label = document.createElement("div");
   label.className = "source-label";
   label.textContent = labelText;
@@ -528,6 +802,9 @@ function appendSourcesToBubble(bubbleEl, sources) {
   for (const source of items) {
     const card = document.createElement(source.url ? "a" : "div");
     card.className = "source-card";
+    const retrievalLabel = source.retrievalDate
+      ? `Retrieved ${source.retrievalDate}`
+      : "";
 
     if (source.url) {
       card.href = source.url;
@@ -538,6 +815,7 @@ function appendSourcesToBubble(bubbleEl, sources) {
     card.innerHTML = `
       <span class="source-domain">${formatInline(getDomainLabel(source.url))}</span>
       <strong class="source-title">${formatInline(source.title || "Untitled source")}</strong>
+      ${retrievalLabel ? `<span class="source-retrieved">${formatInline(retrievalLabel)}</span>` : ""}
       <span class="source-snippet">${formatInline(source.snippet || "No summary available.")}</span>
       <span class="source-cta">${formatInline(
         source.cta || (source.url ? "Open source" : "Source unavailable")
@@ -547,6 +825,22 @@ function appendSourcesToBubble(bubbleEl, sources) {
   }
 
   sourcesEl.appendChild(grid);
+}
+
+function appendWebSearchIndicator(bubbleEl, payload = {}) {
+  const { sourcesEl } = getBubbleParts(bubbleEl);
+
+  if (!sourcesEl || sourcesEl.querySelector(".web-search-indicator")) {
+    return;
+  }
+
+  const indicator = document.createElement("div");
+  indicator.className = "web-search-indicator";
+  indicator.title =
+    payload.reason ||
+    "Web search was used automatically because this topic can change frequently.";
+  indicator.textContent = "🌐 Web search used for current info";
+  sourcesEl.prepend(indicator);
 }
 
 function renderAttachments() {
@@ -567,9 +861,35 @@ function renderAttachments() {
   }
 
   for (const attachment of items) {
+    const status = getAttachmentIngestionStatus(attachment);
+    const statusError = getAttachmentIngestionError(attachment);
     const chip = document.createElement("div");
-    chip.className = `attachment-chip${attachment.isPending ? " is-pending" : ""}`;
+    chip.className = `attachment-chip${attachment.isPending ? " is-pending" : ""} is-${status}`;
     chip.dataset.attachmentId = attachment.id || "";
+
+    const statusEl = document.createElement("span");
+    statusEl.className = `attachment-status-icon is-${status}`;
+    statusEl.setAttribute("aria-label", status);
+
+    if (status === "failed") {
+      statusEl.textContent = "!";
+      statusEl.title = statusError || "Indexing failed. Try re-uploading.";
+      statusEl.tabIndex = 0;
+      statusEl.role = "button";
+      statusEl.addEventListener("click", () => {
+        setHintOverride(statusEl.title);
+      });
+      statusEl.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          setHintOverride(statusEl.title);
+        }
+      });
+    } else if (status === "done") {
+      statusEl.textContent = "✓";
+    } else {
+      statusEl.setAttribute("aria-label", "Processing");
+    }
 
     const copy = document.createElement("div");
     copy.className = "attachment-copy";
@@ -596,20 +916,24 @@ function renderAttachments() {
     if (attachment.isPending) {
       meta.textContent = getPendingAttachmentStatus(attachment);
     } else {
-      meta.textContent = metaParts.join(" · ") || "Ready for this chat";
+      meta.textContent =
+        status === "done"
+          ? ["Ready", ...metaParts].join(" · ")
+          : metaParts.join(" · ") || "Ready";
     }
 
     copy.append(title, meta);
+    chip.appendChild(statusEl);
     chip.appendChild(copy);
 
-    if (!attachment.isPending || attachment.errorMessage) {
+    if (!attachment.isPending || status === "failed") {
       const removeBtn = document.createElement("button");
       removeBtn.type = "button";
       removeBtn.className = "attachment-remove";
       removeBtn.textContent = "Remove";
       removeBtn.disabled = isUploading || isStreaming;
       removeBtn.addEventListener("click", () => {
-        if (attachment.errorMessage) {
+        if (status === "failed") {
           pendingIngestionJobs.delete(attachment.id);
           renderAttachments();
           updateComposerState();
@@ -649,6 +973,20 @@ function clearWelcomeState() {
   }
 }
 
+function getSessionTitleFromDom() {
+  const firstUserBubble = messagesEl.querySelector(".bubble[data-role='user']");
+  const raw = firstUserBubble?.dataset?.raw || "";
+  const title = raw.replace(/\s+/g, " ").trim() || "New chat";
+  return title.length > 48 ? `${title.slice(0, 48).trim()}...` : title;
+}
+
+function updateChatChrome() {
+  const hasMessages = Boolean(messagesEl.querySelector(".bubble-wrap"));
+  chatTopbarEl.hidden = !hasMessages;
+  mobileSidebarFabEl.hidden = hasMessages;
+  chatTitleEl.textContent = hasMessages ? getSessionTitleFromDom() : "New chat";
+}
+
 function buildStarterChip(prompt) {
   const button = document.createElement("button");
   button.type = "button";
@@ -667,41 +1005,13 @@ function buildStarterChip(prompt) {
   return button;
 }
 
-function renderStarterRow() {
-  starterRowEl.innerHTML = "";
-
-  for (const prompt of STARTER_PROMPTS) {
-    starterRowEl.appendChild(buildStarterChip(prompt));
-  }
-}
-
 function showWelcome() {
   messagesEl.innerHTML = "";
 
   const welcome = document.createElement("section");
   welcome.className = "welcome-state";
   welcome.innerHTML = `
-    <span class="welcome-kicker">Eneto assistant</span>
-    <h2 class="welcome-title">Get fast answers on products, funding, installation, and Eneto Connect.</h2>
-    <p class="welcome-copy">
-      Ask about heating and cooling systems, fixed-price offers, financing, funding eligibility,
-      or uploaded documents. Turn on <code>Web search</code> for current answers, or add
-      <code>search web</code> only when you need a live lookup.
-    </p>
-    <div class="welcome-feature-grid">
-      <article class="welcome-feature">
-        <strong>Products and installation</strong>
-        <span>Compare systems, understand timelines, and plan the next step clearly.</span>
-      </article>
-      <article class="welcome-feature">
-        <strong>Funding and financing</strong>
-        <span>Use live web lookups for current eligibility, pricing context, and updates.</span>
-      </article>
-      <article class="welcome-feature">
-        <strong>Files and quotes</strong>
-        <span>Upload PDFs, spreadsheets, or proposals and ask the assistant to break them down.</span>
-      </article>
-    </div>
+    <h2 class="welcome-title">Ask about Eneto products, funding, or your documents.</h2>
   `;
 
   const chipGroup = document.createElement("div");
@@ -713,6 +1023,7 @@ function showWelcome() {
 
   welcome.appendChild(chipGroup);
   messagesEl.appendChild(welcome);
+  updateChatChrome();
   scrollToBottom();
 }
 
@@ -726,6 +1037,143 @@ function showErrorInBubble(bubbleEl, message) {
   const { contentEl } = getBubbleParts(bubbleEl);
   contentEl.innerHTML = formatText(message);
   finalizeAssistantBubble(bubbleEl);
+}
+
+function getRelativeTimeLabel(value) {
+  const date = value ? new Date(value) : null;
+
+  if (!date || Number.isNaN(date.getTime())) {
+    return "";
+  }
+
+  const diffMs = Date.now() - date.getTime();
+  const minutes = Math.max(1, Math.floor(diffMs / 60_000));
+
+  if (minutes < 60) {
+    return `${minutes}m ago`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+
+  if (hours < 24) {
+    return `${hours}h ago`;
+  }
+
+  if (hours < 48) {
+    return "Yesterday";
+  }
+
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function renderRecentChats(sessions = []) {
+  recentChatsEl.innerHTML = "";
+
+  if (!sessions.length) {
+    const empty = document.createElement("div");
+    empty.className = "recent-empty";
+    empty.textContent = "No recent chats yet";
+    recentChatsEl.appendChild(empty);
+    return;
+  }
+
+  for (const session of sessions) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = `recent-chat${session.id === sessionId ? " is-active" : ""}`;
+    item.innerHTML = `
+      <span>${escapeHtml(session.title || "New chat")}</span>
+      <small>${escapeHtml(getRelativeTimeLabel(session.updatedAt))}</small>
+    `;
+    item.addEventListener("click", () => loadSession(session.id));
+    recentChatsEl.appendChild(item);
+  }
+}
+
+async function loadRecentChats() {
+  renderRecentChats([]);
+
+  try {
+    const response = await fetch("/api/sessions");
+
+    if (!response.ok) {
+      return;
+    }
+
+    const data = await response.json();
+    renderRecentChats(Array.isArray(data.sessions) ? data.sessions : []);
+  } catch (_error) {
+    renderRecentChats([]);
+  }
+}
+
+function renderTurns(turns = []) {
+  messagesEl.innerHTML = "";
+
+  if (!turns.length) {
+    showWelcome();
+    return;
+  }
+
+  for (const turn of turns) {
+    appendBubble(turn.role === "assistant" ? "assistant" : "user", turn.content || "");
+  }
+
+  updateChatChrome();
+  scrollToBottom();
+}
+
+async function loadSession(nextSessionId) {
+  if (!nextSessionId || isStreaming || isUploading) {
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/session/${encodeURIComponent(nextSessionId)}`);
+    const data = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      throw new Error(data?.error || "Could not load that chat.");
+    }
+
+    sessionId = nextSessionId;
+    sessionStorage.setItem(SESSION_KEY, sessionId);
+    attachments = Array.isArray(data.attachments) ? data.attachments : [];
+    pendingIngestionJobs.clear();
+    renderTurns(Array.isArray(data.turns) ? data.turns : []);
+    renderAttachments();
+    updateComposerState();
+    closeSidebar();
+    void loadRecentChats();
+  } catch (error) {
+    setHintOverride(error.message || "Could not load that chat.");
+  }
+}
+
+function startNewChat() {
+  clearTimeout(hintOverrideTimerId);
+  sessionId = crypto.randomUUID();
+  sessionStorage.setItem(SESSION_KEY, sessionId);
+  attachments = [];
+  for (const documentId of ingestPollTimeoutIds.keys()) {
+    stopIngestionPolling(documentId);
+  }
+  pendingIngestionJobs.clear();
+  pendingUploadLabel = "";
+  hintOverride = "";
+  renderAttachments();
+  showWelcome();
+  updateComposerState();
+  closeSidebar();
+  void loadRecentChats();
+}
+
+function openSidebar() {
+  document.body.classList.add("sidebar-open");
+}
+
+function closeSidebar() {
+  document.body.classList.remove("sidebar-open");
 }
 
 function stopIngestionPolling(documentId) {
@@ -776,7 +1224,15 @@ function scheduleIngestionPolling(jobId, documentId) {
       if (data?.status === "failed") {
         pendingIngestionJobs.set(documentId, {
           ...pendingAttachment,
-          errorMessage: data?.errorMessage || "Indexing failed. Remove and try again."
+          ingestion_status: "failed",
+          ingestion_error:
+            data?.ingestion_error ||
+            data?.errorMessage ||
+            "Indexing failed. Remove and try again.",
+          errorMessage:
+            data?.ingestion_error ||
+            data?.errorMessage ||
+            "Indexing failed. Remove and try again."
         });
         stopIngestionPolling(documentId);
         renderAttachments();
@@ -785,7 +1241,12 @@ function scheduleIngestionPolling(jobId, documentId) {
       }
 
       // Still processing — update display and continue polling
-      pendingIngestionJobs.set(documentId, { ...pendingAttachment });
+      pendingIngestionJobs.set(documentId, {
+        ...pendingAttachment,
+        ingestion_status: data?.ingestion_status || data?.status || "processing",
+        ingestion_error: data?.ingestion_error || null,
+        errorMessage: ""
+      });
       renderAttachments();
       updateComposerState();
 
@@ -811,6 +1272,8 @@ function scheduleIngestionPolling(jobId, documentId) {
 
       pendingIngestionJobs.set(documentId, {
         ...pendingAttachment,
+        ingestion_status: "failed",
+        ingestion_error: "Could not reach the server. Remove and try again.",
         errorMessage: "Could not reach the server. Remove and try again."
       });
       stopIngestionPolling(documentId);
@@ -897,6 +1360,8 @@ async function uploadSelectedFile(file) {
         sizeBytes: file.size,
         startedAt: Date.now(),
         isPending: true,
+        ingestion_status: "queued",
+        ingestion_error: null,
         errorMessage: ""
       });
       scheduleIngestionPolling(data.jobId, data.documentId);
@@ -980,7 +1445,7 @@ async function sendMessage() {
       body: JSON.stringify({
         message: text,
         sessionId,
-        forceWebSearch: isWebSearchEnabled
+        webSearchMode
       })
     });
 
@@ -1044,6 +1509,18 @@ async function sendMessage() {
           continue;
         }
 
+        if (event.type === "citations") {
+          applyCitationsToBubble(botEl, event.content);
+          scheduleScroll();
+          continue;
+        }
+
+        if (event.type === "web_search_indicator") {
+          appendWebSearchIndicator(botEl, event.content);
+          scheduleScroll();
+          continue;
+        }
+
         if (event.type === "done") {
           streamFinished = true;
           finalizeAssistantBubble(botEl);
@@ -1096,6 +1573,10 @@ sendBtn.addEventListener("click", () => {
   sendMessage();
 });
 
+chatMenuBtn.addEventListener("click", () => {
+  chatMenuPopover.hidden = !chatMenuPopover.hidden;
+});
+
 fileBtn.addEventListener("click", () => {
   if (fileBtn.disabled) {
     return;
@@ -1109,12 +1590,7 @@ webSearchToggleEl.addEventListener("click", () => {
     return;
   }
 
-  isWebSearchEnabled = !isWebSearchEnabled;
-  localStorage.setItem(
-    WEB_SEARCH_TOGGLE_KEY,
-    isWebSearchEnabled ? "true" : "false"
-  );
-  updateComposerState();
+  cycleWebSearchMode();
 });
 
 fileInputEl.addEventListener("change", () => {
@@ -1133,35 +1609,30 @@ resetBtn.addEventListener("click", async () => {
     return;
   }
 
-  try {
-    await fetch("/api/reset", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ sessionId })
-    });
-  } catch (_error) {
-    // Ignore reset errors and continue with a fresh local session.
-  }
-
-  clearTimeout(hintOverrideTimerId);
-  sessionId = crypto.randomUUID();
-  sessionStorage.setItem(SESSION_KEY, sessionId);
-  attachments = [];
-  for (const documentId of ingestPollTimeoutIds.keys()) {
-    stopIngestionPolling(documentId);
-  }
-  pendingIngestionJobs.clear();
-  pendingUploadLabel = "";
-  hintOverride = "";
-  renderAttachments();
-  showWelcome();
-  updateComposerState();
+  startNewChat();
 });
 
-renderStarterRow();
+sidebarToggleEl.addEventListener("click", openSidebar);
+mobileSidebarFabEl.addEventListener("click", openSidebar);
+sidebarOverlayEl.addEventListener("click", closeSidebar);
+
+messagesEl.addEventListener("click", (event) => {
+  const marker = event.target.closest(".citation-marker");
+
+  if (!marker) {
+    return;
+  }
+
+  const bubbleEl = marker.closest(".bubble");
+  const citation = getCitationByNumber(
+    getBubbleCitations(bubbleEl),
+    Number(marker.dataset.citeNumber || 0)
+  );
+  openCitation(citation);
+});
+
 showWelcome();
 renderAttachments();
 loadSessionAttachments();
+loadRecentChats();
 updateComposerState();

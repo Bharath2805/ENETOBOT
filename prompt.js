@@ -34,10 +34,14 @@ Never make up product features, service offerings, or compatibility claims that 
 
 === CITATION RULES ===
 When you use information from [DOCUMENT CONTEXT]: name the document and page number.
-When you use information from [BEG RECORDS]: name the model and cite the page number.
+When you use information from [BEG RECORDS]: state that the answer is based on Eneto's structured BEG database, name the source if available, name the model, cite the page number, and end with a short line like "Based on BEG records last updated on YYYY-MM-DD."
 When you use information from [WEB CONTEXT]: signal it with "Based on current web results" or similar.
+When [WEB CONTEXT] supports a factual claim, especially for funding, legal, or pricing answers, cite the source URL and retrieval date.
+When retrieved context includes citation markers like [1] or [2], place the matching marker immediately after the factual claim it supports. Example: The model is listed as BEG eligible under the structured record [2]. Do not invent a marker if no listed source supports the claim.
 When sources conflict: prefer [BEG RECORDS] over [DOCUMENT CONTEXT] for exact model eligibility, and flag any mismatch between documents and live web information.
 When no context is provided: answer only from what you know with certainty from this prompt; admit uncertainty clearly and do not guess.
+For BEG / BAFA / KfW funding questions without a matching [BEG RECORDS] entry, say "I don't have a verified BEG record for this model" and recommend checking BAFA/KfW directly or using web search for current policy details. Never invent eligibility.
+If a BEG record lists availability, EE indicator, or other conditions, phrase eligibility conditionally instead of as a flat yes/no.
 
 === CONVERSATION MEMORY ===
 Older turns may appear under [CONVERSATION SUMMARY] — treat these as established fact.
@@ -61,7 +65,10 @@ const SEARCH_TRIGGER_KEYWORDS = [
   "today",
   "latest",
   "current",
+  "now",
   "right now",
+  "heute",
+  "jetzt",
   "news",
   "price",
   "cost",
@@ -147,7 +154,10 @@ const TIME_SENSITIVE_SEARCH_KEYWORDS = [
   "today",
   "latest",
   "current",
+  "now",
   "right now",
+  "heute",
+  "jetzt",
   "news",
   "this week",
   "this year",
@@ -312,6 +322,7 @@ function formatTurn(turn) {
 
 function buildPrompt({
   history,
+  sessionFacts,
   summary,
   webContext,
   ragContext,
@@ -322,6 +333,10 @@ function buildPrompt({
   const parts = [];
 
   // ── Memory ──
+  if (sessionFacts) {
+    parts.push(`[KNOWN SESSION FACTS — source of truth for prior decisions, products, and constraints]\n${sessionFacts}`);
+  }
+
   if (summary) {
     parts.push(`[CONVERSATION SUMMARY]\n${summary}`);
   }
@@ -335,7 +350,10 @@ function buildPrompt({
     parts.push(
       `[INSTRUCTIONS FOR THIS ANSWER]\n` +
       `This answer should rely primarily on [WEB CONTEXT] below.\n` +
+      `If the user refers to a previous decision, product, or constraint, use [KNOWN SESSION FACTS] as the source of truth. The prose summary is supporting context, not authoritative.\n` +
       `Signal clearly that the answer is based on current web results.\n` +
+      `Cite source URLs and retrieval dates for factual funding, legal, or pricing claims.\n` +
+      `Use the listed [n] citation markers immediately after supported factual claims.\n` +
       `If a fact may have changed since the search, qualify it.\n` +
       `Do not invent any data not present in the web context.`
     );
@@ -343,16 +361,23 @@ function buildPrompt({
     parts.push(
       `[INSTRUCTIONS FOR THIS ANSWER]\n` +
       `This answer should rely on [DOCUMENT CONTEXT] and [BEG RECORDS] below.\n` +
+      `If the user refers to a previous decision, product, or constraint, use [KNOWN SESSION FACTS] as the source of truth. The prose summary is supporting context, not authoritative.\n` +
       `Cite the document title and page number for every factual claim.\n` +
+      `For [BEG RECORDS], state that the answer uses Eneto's structured BEG database, include source and last-updated date, and phrase conditional eligibility conditionally.\n` +
+      `Use the listed [n] citation markers immediately after supported factual claims.\n` +
       `If the documents do not cover the question, say so — do not guess.`
     );
   } else if (mode === "hybrid") {
     parts.push(
       `[INSTRUCTIONS FOR THIS ANSWER]\n` +
       `Use both [DOCUMENT CONTEXT] / [BEG RECORDS] and [WEB CONTEXT] below.\n` +
+      `If the user refers to a previous decision, product, or constraint, use [KNOWN SESSION FACTS] as the source of truth. The prose summary is supporting context, not authoritative.\n` +
       `Prefer [BEG RECORDS] for exact model eligibility facts.\n` +
       `Prefer [WEB CONTEXT] for anything time-sensitive (current rates, policy changes).\n` +
       `If the two sources disagree, state both and note which is more recent.\n` +
+      `For [BEG RECORDS], state that the answer uses Eneto's structured BEG database, include source and last-updated date, and phrase conditional eligibility conditionally.\n` +
+      `For [WEB CONTEXT], cite source URLs and retrieval dates for factual funding, legal, or pricing claims.\n` +
+      `Use the listed [n] citation markers immediately after supported factual claims.\n` +
       `Cite document name + page for document facts, and signal web results for web facts.`
     );
   } else {
@@ -360,6 +385,7 @@ function buildPrompt({
     parts.push(
       `[INSTRUCTIONS FOR THIS ANSWER]\n` +
       `Answer from your knowledge of Eneto, Bosch HVAC, and BEG funding.\n` +
+      `If the user refers to a previous decision, product, or constraint, use [KNOWN SESSION FACTS] as the source of truth. The prose summary is supporting context, not authoritative.\n` +
       `If you are uncertain, say so and direct the user to ${DOCS_URL}.\n` +
       `Do not invent model numbers, prices, subsidy percentages, or policy details.`
     );
@@ -380,7 +406,7 @@ function buildPrompt({
 
   if (begContext) {
     parts.push(
-      `[BEG RECORDS — highest-confidence source for model eligibility; cite page number]\n${begContext}`
+      `[BEG RECORDS — highest-confidence source for model eligibility; cite page number, source, and last-updated date]\n${begContext}`
     );
   }
 

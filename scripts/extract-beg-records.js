@@ -54,8 +54,11 @@ async function main() {
   }
 
   const rawRecords = JSON.parse(result.stdout || "[]");
+  const syncedAt = new Date();
   const records = rawRecords.map((record) => ({
     ...record,
+    source: "BAFA Förderliste",
+    last_updated: syncedAt,
     documentId: document.id,
     id: buildRecordId(document.id, record)
   }));

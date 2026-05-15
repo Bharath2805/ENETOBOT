@@ -1,0 +1,14 @@
+{
+  "name": "eneto-ingest-worker",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@google-cloud/firestore": "^7.0.0",
+    "@google/genai": "^1.47.0",
+    "dotenv": "^17.0.0",
+    "express": "^5.1.0"
+  }
+}

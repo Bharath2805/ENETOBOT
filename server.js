@@ -47,6 +47,8 @@ const sessionCacheTouchedAt = new Map();
 const rateLimitBuckets = new Map();
 const uploadRateLimitBuckets = new Map();
 const SESSION_CACHE_TTL_MS = 30_000;
+const MAX_SESSION_FACT_ITEMS = 50;
+const FACT_EXTRACTION_TIMEOUT_MS = 8_000;
 let globalStoreConfig = null;
 let globalStoreLoadedAt = 0;
 const GLOBAL_STORE_TTL_MS = 5 * 60_000;
@@ -158,6 +160,24 @@ app.get("/", (_req, res) => {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function ingestionTimestamp() {
+  return new Date();
+}
+
+function truncateIngestionError(error) {
+  return String(error?.message || error || "Ingestion failed").slice(0, 500);
+}
+
+function normalizeDocumentIngestionStatus(documentMeta, fallbackStatus = "done") {
+  const status = String(
+    documentMeta?.ingestion_status || documentMeta?.ingestionStatus || fallbackStatus
+  ).trim();
+
+  return ["queued", "processing", "done", "failed"].includes(status)
+    ? status
+    : fallbackStatus;
 }
 
 function supportsInlineLongContextMimeType(mimeType) {
@@ -333,11 +353,12 @@ function buildManufacturerAliases(name) {
 
 function findManufacturerMatch(message, manufacturers) {
   const normalizedMessage = normalizeForMatch(message);
+  const paddedMessage = ` ${normalizedMessage} `;
   let bestMatch = null;
 
   for (const manufacturer of manufacturers) {
     for (const alias of buildManufacturerAliases(manufacturer)) {
-      if (!alias || !normalizedMessage.includes(alias)) {
+      if (!alias || !paddedMessage.includes(` ${alias} `)) {
         continue;
       }
 
@@ -404,13 +425,223 @@ function extractModelQuery(message, manufacturerMatch, heatPumpType) {
   return cleaned;
 }
 
+function asStringArray(value) {
+  return Array.isArray(value)
+    ? value.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+}
+
+function capOldest(items, limit = MAX_SESSION_FACT_ITEMS) {
+  return items.length > limit ? items.slice(items.length - limit) : items;
+}
+
+function dedupeStringsCaseInsensitive(items) {
+  const seen = new Set();
+  const output = [];
+
+  for (const item of items) {
+    const value = String(item || "").trim();
+    const key = normalizeForMatch(value);
+
+    if (!value || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    output.push(value);
+  }
+
+  return output;
+}
+
+function normalizeFactTimestamp(value) {
+  const date = toDateFromTimestamp(value);
+  return date || null;
+}
+
+function normalizeBegDecision(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const product = String(value.product || "").trim();
+  const verdict = String(value.verdict || "unknown").trim();
+
+  if (!product || !["eligible", "not_eligible", "conditional", "unknown"].includes(verdict)) {
+    return null;
+  }
+
+  return {
+    product,
+    verdict,
+    conditions:
+      value.conditions === null || value.conditions === undefined
+        ? null
+        : String(value.conditions).trim() || null,
+    decided_at: normalizeFactTimestamp(value.decided_at) || new Date(),
+    source_last_updated: normalizeFactTimestamp(value.source_last_updated)
+  };
+}
+
+function normalizeDocumentReference(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const docId = String(value.doc_id || value.docId || "").trim();
+  const filename = String(value.filename || value.displayName || "").trim();
+
+  if (!docId) {
+    return null;
+  }
+
+  return {
+    filename: filename || "Uploaded document",
+    doc_id: docId
+  };
+}
+
+function sortBegDecisionsByNewest(decisions) {
+  return [...decisions].sort((left, right) => {
+    const leftTime = normalizeFactTimestamp(left.decided_at)?.getTime() || 0;
+    const rightTime = normalizeFactTimestamp(right.decided_at)?.getTime() || 0;
+    return rightTime - leftTime;
+  });
+}
+
+function normalizeSessionFacts(value) {
+  const facts = value && typeof value === "object" ? value : {};
+  const documentsById = new Map();
+
+  for (const documentRef of (Array.isArray(facts.documents_referenced)
+    ? facts.documents_referenced
+    : []
+  )) {
+    const normalized = normalizeDocumentReference(documentRef);
+
+    if (normalized && !documentsById.has(normalized.doc_id)) {
+      documentsById.set(normalized.doc_id, normalized);
+    }
+  }
+
+  return {
+    products_discussed: capOldest(
+      dedupeStringsCaseInsensitive(asStringArray(facts.products_discussed))
+    ),
+    beg_decisions: sortBegDecisionsByNewest(
+      (Array.isArray(facts.beg_decisions) ? facts.beg_decisions : [])
+        .map(normalizeBegDecision)
+        .filter(Boolean)
+    ),
+    customer_constraints: capOldest(
+      dedupeStringsCaseInsensitive(asStringArray(facts.customer_constraints))
+    ),
+    open_questions: capOldest(
+      dedupeStringsCaseInsensitive(asStringArray(facts.open_questions))
+    ),
+    documents_referenced: capOldest([...documentsById.values()]),
+    last_updated: normalizeFactTimestamp(facts.last_updated)
+  };
+}
+
+function mergeStringFacts(existing, incoming) {
+  return capOldest(
+    dedupeStringsCaseInsensitive([
+      ...asStringArray(existing),
+      ...asStringArray(incoming)
+    ])
+  );
+}
+
+function removeResolvedOpenQuestions(existingQuestions, resolvedQuestions) {
+  const resolved = asStringArray(resolvedQuestions).map(normalizeForMatch);
+
+  if (!resolved.length) {
+    return existingQuestions;
+  }
+
+  return existingQuestions.filter((question) => {
+    const normalizedQuestion = normalizeForMatch(question);
+    return !resolved.some(
+      (item) =>
+        item &&
+        (normalizedQuestion.includes(item) || item.includes(normalizedQuestion))
+    );
+  });
+}
+
+function mergeDocumentFacts(existing, incoming, attachments = []) {
+  const documentsById = new Map();
+  const attachmentFacts = attachments
+    .filter((attachment) => attachment?.id)
+    .map((attachment) => ({
+      filename: attachment.displayName || attachment.name || "Uploaded document",
+      doc_id: attachment.id
+    }));
+
+  for (const value of [
+    ...(Array.isArray(existing) ? existing : []),
+    ...(Array.isArray(incoming) ? incoming : []),
+    ...attachmentFacts
+  ]) {
+    const normalized = normalizeDocumentReference(value);
+
+    if (normalized) {
+      documentsById.set(normalized.doc_id, normalized);
+    }
+  }
+
+  return capOldest([...documentsById.values()]);
+}
+
+function mergeSessionFacts(existingFacts, extractedFacts, attachments = []) {
+  const existing = normalizeSessionFacts(existingFacts);
+  const extracted = extractedFacts && typeof extractedFacts === "object"
+    ? extractedFacts
+    : {};
+  const now = new Date();
+  const begDecisions = [
+    ...existing.beg_decisions,
+    ...(Array.isArray(extracted.beg_decisions) ? extracted.beg_decisions : [])
+      .map((decision) => normalizeBegDecision({
+        ...decision,
+        decided_at: decision?.decided_at || now
+      }))
+      .filter(Boolean)
+  ];
+  const openQuestions = removeResolvedOpenQuestions(
+    mergeStringFacts(existing.open_questions, extracted.open_questions),
+    extracted.resolved_open_questions
+  );
+
+  return normalizeSessionFacts({
+    products_discussed: mergeStringFacts(
+      existing.products_discussed,
+      extracted.products_discussed
+    ),
+    beg_decisions: begDecisions,
+    customer_constraints: mergeStringFacts(
+      existing.customer_constraints,
+      extracted.customer_constraints
+    ),
+    open_questions: openQuestions,
+    documents_referenced: mergeDocumentFacts(
+      existing.documents_referenced,
+      extracted.documents_referenced,
+      attachments
+    ),
+    last_updated: now
+  });
+}
+
 
 function createDefaultSession() {
   return {
     attachments: [],
     fileSearchStoreName: null,
     turns: [],
-    summary: null
+    summary: null,
+    session_facts: normalizeSessionFacts(null)
   };
 }
 
@@ -419,7 +650,8 @@ function normalizeSession(session) {
     attachments: Array.isArray(session?.attachments) ? session.attachments : [],
     fileSearchStoreName: session?.fileSearchStoreName || null,
     turns: Array.isArray(session?.turns) ? session.turns : [],
-    summary: session?.summary || null
+    summary: session?.summary || null,
+    session_facts: normalizeSessionFacts(session?.session_facts || session?.sessionFacts)
   };
 }
 
@@ -602,7 +834,21 @@ function buildMediaAttachmentParts(attachments) {
     );
 }
 
-function extractDocumentSources(groundingMetadata) {
+function findAttachmentForDocumentSource(title, url, attachments = []) {
+  const haystack = normalizeForMatch(`${title} ${url}`);
+
+  return attachments.find((attachment) => {
+    const candidates = [
+      attachment.id,
+      attachment.name,
+      attachment.displayName
+    ].map(normalizeForMatch).filter(Boolean);
+
+    return candidates.some((candidate) => haystack.includes(candidate));
+  }) || null;
+}
+
+function extractDocumentSources(groundingMetadata, attachments = []) {
   const groundingChunks = groundingMetadata?.groundingChunks || [];
   const seen = new Set();
   const sources = [];
@@ -633,16 +879,100 @@ function extractDocumentSources(groundingMetadata) {
       continue;
     }
 
+    const attachment = findAttachmentForDocumentSource(title, url, attachments);
+
     seen.add(key);
     sources.push({
       title,
       url,
+      doc_id: attachment?.id || null,
       snippet,
       cta: url ? "Open document" : "Grounded citation"
     });
   }
 
   return sources;
+}
+
+function extractPageNumber(value) {
+  const match = String(value || "").match(/\bpage\s+(\d+)\b/i);
+  return match ? Number(match[1]) : null;
+}
+
+function truncateSnippet(value, limit = 200) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > limit ? `${text.slice(0, limit).trim()}...` : text;
+}
+
+function buildCitation(idNumber, type, source) {
+  const rawUrl = String(source?.url || "").trim();
+  const url = /^https?:\/\//i.test(rawUrl) ? rawUrl : "";
+
+  return {
+    id: `cite_${idNumber}`,
+    type,
+    title: String(source?.title || "Source").trim(),
+    doc_id: type === "document" ? source?.doc_id || null : null,
+    page: source?.page ?? extractPageNumber(source?.snippet || source?.title),
+    url,
+    snippet: truncateSnippet(source?.snippet || ""),
+    retrieved_at:
+      source?.retrieved_at ||
+      source?.retrievalDate ||
+      source?.last_updated ||
+      source?.lastUpdated ||
+      null,
+    source: source?.source || null,
+    last_updated: source?.last_updated || source?.lastUpdated || null
+  };
+}
+
+function buildCitations({ webSources = [], begSources = [], documentSources = [] }) {
+  let index = 1;
+  const citations = [];
+
+  for (const source of webSources) {
+    citations.push(buildCitation(index, "web", source));
+    index += 1;
+  }
+
+  for (const source of begSources) {
+    citations.push(buildCitation(index, "beg_record", source));
+    index += 1;
+  }
+
+  for (const source of documentSources) {
+    citations.push(buildCitation(index, "document", source));
+    index += 1;
+  }
+
+  return citations;
+}
+
+function annotateWebContextWithCitations(webContext, webSources) {
+  if (!webContext || !webSources.length) {
+    return webContext;
+  }
+
+  return String(webContext).replace(/Source\s+(\d+):/g, (_match, number) => {
+    const citationNumber = Number(number);
+    return Number.isFinite(citationNumber)
+      ? `Source [${citationNumber}]:`
+      : _match;
+  });
+}
+
+function annotateBegContextWithCitations(begContext, begSources, offset) {
+  if (!begContext || !begSources.length) {
+    return begContext;
+  }
+
+  return String(begContext).replace(/^(\d+)\.\s+/gm, (_match, number) => {
+    const citationNumber = offset + Number(number);
+    return Number.isFinite(citationNumber)
+      ? `[${citationNumber}] `
+      : _match;
+  });
 }
 
 async function waitForMediaFileReady(fileName) {
@@ -829,6 +1159,9 @@ async function importDocumentIntoSessionStore({
     sourceType: "user_upload",
     language: "en",
     ingestionStatus: "done",
+    ingestion_status: "done",
+    ingestion_error: null,
+    ingestion_updated_at: ingestionTimestamp(),
     scope: "session",
     isScan: false,
     geminiFileName: String(uploadedFile.name || "").trim(),
@@ -852,6 +1185,19 @@ async function processDocumentInBackground({
     await firestoreLib.updateIngestionJob(jobId, {
       status: "processing",
       errorMessage: null
+    });
+    await firestoreLib.saveDocument(documentId, {
+      filename: originalName,
+      displayTitle: originalName,
+      sourceType: "user_upload",
+      language: "en",
+      ingestionStatus: "processing",
+      ingestion_status: "processing",
+      ingestion_error: null,
+      ingestion_updated_at: ingestionTimestamp(),
+      scope: "session",
+      isScan: false,
+      geminiFileName
     });
 
     const readyFile = await waitForMediaFileReady(geminiFileName);
@@ -884,14 +1230,32 @@ async function processDocumentInBackground({
       firestoreLib.updateIngestionJob(jobId, {
         status: "done",
         errorMessage: null
+      }),
+      firestoreLib.saveDocument(documentId, {
+        filename: originalName,
+        displayTitle: originalName,
+        sourceType: "user_upload",
+        language: "en",
+        ingestionStatus: "done",
+        ingestion_status: "done",
+        ingestion_error: null,
+        ingestion_updated_at: ingestionTimestamp(),
+        scope: "session",
+        isScan: false,
+        geminiFileName,
+        fileSearchStoreName: attachment.name
+          ? session.fileSearchStoreName
+          : null,
+        geminiDocumentName: attachment.name
       })
     ]);
   } catch (error) {
     console.error("[processDocumentInBackground]", error.message || error);
+    const errorMessage = truncateIngestionError(error);
     await Promise.allSettled([
       firestoreLib.updateIngestionJob(jobId, {
         status: "failed",
-        errorMessage: error.message || String(error)
+        errorMessage
       }),
       firestoreLib.saveDocument(documentId, {
         filename: originalName,
@@ -899,6 +1263,9 @@ async function processDocumentInBackground({
         sourceType: "user_upload",
         language: "en",
         ingestionStatus: "failed",
+        ingestion_status: "failed",
+        ingestion_error: errorMessage,
+        ingestion_updated_at: ingestionTimestamp(),
         scope: "session",
         isScan: false,
         geminiFileName
@@ -987,7 +1354,13 @@ async function runTavilySearch(query, options = {}) {
     }
 
     const data = await response.json();
+    const retrievedAt = new Date().toISOString();
+    const retrievalDate = retrievedAt.slice(0, 10);
     const parts = [];
+    if (options.contextNote) {
+      parts.push(String(options.contextNote));
+    }
+
     const rawSources = Array.isArray(data.results)
       ? data.results.slice(0, config.MAX_SEARCH_RESULTS).map((result, index) => {
           const title = String(result.title || `Source ${index + 1}`).trim();
@@ -1006,6 +1379,8 @@ async function runTavilySearch(query, options = {}) {
             title,
             url,
             snippet,
+            retrieved_at: retrievedAt,
+            retrievalDate,
             cta: url ? "Open source" : "Source unavailable"
           };
         })
@@ -1029,7 +1404,7 @@ async function runTavilySearch(query, options = {}) {
     if (sources.length) {
       const formattedResults = sources.map(
         (source, index) =>
-          `Source ${index + 1}: ${source.title}\nURL: ${source.url || "Unavailable"}\nSummary: ${source.snippet || "No summary available."}`
+          `Source ${index + 1}: ${source.title}\nURL: ${source.url || "Unavailable"}\nRetrieved: ${source.retrievalDate || retrievalDate}\nSummary: ${source.snippet || "No summary available."}`
       );
       parts.push(`Sources:\n${formattedResults.join("\n\n")}`);
     }
@@ -1085,6 +1460,143 @@ async function summarizeTurns(turns) {
   }
 }
 
+function buildFactExtractionPrompt(turns) {
+  const transcript = turns.map((turn) => {
+    const speaker = turn.role === "assistant" ? "Assistant" : "User";
+    return `${speaker}: ${String(turn.content || "").slice(0, 3000)}`;
+  }).join("\n");
+
+  return `Extract durable session facts from this transcript.
+Return strict JSON only. No markdown.
+Use this exact shape:
+{
+  "products_discussed": [],
+  "beg_decisions": [
+    {
+      "product": "",
+      "verdict": "eligible|not_eligible|conditional|unknown",
+      "conditions": null,
+      "decided_at": null,
+      "source_last_updated": null
+    }
+  ],
+  "customer_constraints": [],
+  "open_questions": [],
+  "resolved_open_questions": [],
+  "documents_referenced": [
+    { "filename": "", "doc_id": "" }
+  ]
+}
+
+Rules:
+- Include only facts explicitly stated or clearly decided in this transcript.
+- Products include heat pump models, AC units, Eneto Connect, or named Eneto products.
+- BEG decisions must be about a specific product/model; use "unknown" when no verdict was reached.
+- Use ISO date strings for timestamps only if present in the transcript; otherwise null.
+- resolved_open_questions are earlier open questions clearly answered by later assistant turns.
+- If none, use empty arrays.
+
+Transcript:
+${transcript}`;
+}
+
+function parseStrictJsonObject(text) {
+  const cleaned = String(text || "")
+    .trim()
+    .replace(/^```(?:json)?/i, "")
+    .replace(/```$/i, "")
+    .trim();
+  return JSON.parse(cleaned);
+}
+
+async function extractSessionFacts(turns) {
+  try {
+    const prompt = buildFactExtractionPrompt(turns);
+    const extraction = genAI.models.generateContent({
+      model: config.GEMINI_MODEL,
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json"
+      }
+    });
+    const timeout = new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("Session fact extraction timed out")),
+        FACT_EXTRACTION_TIMEOUT_MS
+      );
+    });
+    const response = await Promise.race([extraction, timeout]);
+    const parsed = parseStrictJsonObject(response.text || "");
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Session fact extraction returned non-object JSON");
+    }
+
+    return parsed;
+  } catch (error) {
+    console.error("[extractSessionFacts]", error.message || error);
+    return null;
+  }
+}
+
+function formatFactDate(value) {
+  const date = normalizeFactTimestamp(value);
+  return date ? date.toISOString().slice(0, 10) : "unknown";
+}
+
+function buildSessionFactsBlock(sessionFacts) {
+  const facts = normalizeSessionFacts(sessionFacts);
+  const hasFacts =
+    facts.products_discussed.length ||
+    facts.beg_decisions.length ||
+    facts.customer_constraints.length ||
+    facts.open_questions.length ||
+    facts.documents_referenced.length;
+
+  if (!hasFacts) {
+    return null;
+  }
+
+  const products = facts.products_discussed.length
+    ? facts.products_discussed.join(", ")
+    : "None recorded";
+  const begDecisions = facts.beg_decisions.length
+    ? facts.beg_decisions.map((decision) => {
+        const conditions = decision.conditions
+          ? `; conditions: ${decision.conditions}`
+          : "";
+        const sourceDate = decision.source_last_updated
+          ? `; source updated: ${formatFactDate(decision.source_last_updated)}`
+          : "";
+        return `- ${decision.product}: ${decision.verdict}${conditions}; decided: ${formatFactDate(decision.decided_at)}${sourceDate}`;
+      }).join("\n")
+    : "None recorded";
+  const constraints = facts.customer_constraints.length
+    ? facts.customer_constraints.map((item) => `- ${item}`).join("\n")
+    : "None recorded";
+  const openQuestions = facts.open_questions.length
+    ? facts.open_questions.map((item) => `- ${item}`).join("\n")
+    : "None recorded";
+  const documents = facts.documents_referenced.length
+    ? facts.documents_referenced
+        .map((doc) => `- ${doc.filename} (${doc.doc_id})`)
+        .join("\n")
+    : "None recorded";
+
+  return [
+    "## Known facts about this session",
+    `Products discussed: ${products}`,
+    "BEG decisions so far:",
+    begDecisions,
+    "Customer constraints:",
+    constraints,
+    "Open questions:",
+    openQuestions,
+    "Documents referenced:",
+    documents
+  ].join("\n");
+}
+
 function extractDocumentDate(value) {
   const text = String(value || "");
   const fullDateMatch = text.match(/\b(20\d{2})[._-]?(\d{2})[._-]?(\d{2})\b/);
@@ -1100,6 +1612,150 @@ function extractDocumentDate(value) {
   }
 
   return "";
+}
+
+function toDateFromTimestamp(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value.toDate === "function") {
+    return value.toDate();
+  }
+
+  if (value instanceof Date) {
+    return value;
+  }
+
+  if (typeof value === "string" || typeof value === "number") {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  if (typeof value.seconds === "number") {
+    return new Date(value.seconds * 1000);
+  }
+
+  return null;
+}
+
+function formatBegUpdatedDate(value) {
+  const date = toDateFromTimestamp(value);
+  return date ? date.toISOString().slice(0, 10) : "unknown";
+}
+
+// Volatile topics change often enough that a fresh web lookup is useful even
+// when the user did not say "latest" or toggle web search. Keep this list small
+// and category-based so Tavily volume stays bounded and easy to tune.
+function detectVolatileWebSearchTopics(message) {
+  const text = normalizeForMatch(message);
+  const categories = [];
+  const fundingTerms =
+    /\b(beg|bafa|kfw|forderung|foerderung|zuschuss|tilgung|bonus|subsidy|grant|funding|forderungssatz|foerdersatz)\b/;
+  const fundingAmountTerms =
+    /\b(rate|rates|percentage|percent|prozentsatz|amount|betrag|hoehe)\b/;
+  const patterns = [
+    {
+      category: "laws_regulations",
+      regex:
+        /\b(geg|heizungsgesetz|enev|gebaudeenergiegesetz|gebaeudeenergiegesetz|beg richtlinie|beg richtlinien|law|laws|regulation|regulations|gesetz|richtlinie|vorschrift)\b/
+    },
+    {
+      category: "pricing_costs",
+      regex:
+        /\b(price|pricing|cost|costs|kosten|preis|preise|strompreis|electricity|electricity price|heat pump cost|warmepumpe kosten|waermepumpe kosten|installation cost|installationskosten|einbaukosten|montagekosten)\b/
+    },
+    {
+      category: "deadlines_windows",
+      regex:
+        /\b(deadline|deadlines|application window|antragsfrist|frist|stichtag|gultig bis|gueltig bis|valid until|apply by|beantragen bis|forderung endet|foerderung endet)\b/
+    }
+  ];
+
+  if (
+    fundingTerms.test(text) ||
+    (fundingAmountTerms.test(text) &&
+      /\b(funding|subsidy|grant|forderung|foerderung)\b/.test(text))
+  ) {
+    categories.push("funding_amounts_rates");
+  }
+
+  for (const pattern of patterns) {
+    if (pattern.regex.test(text)) {
+      categories.push(pattern.category);
+    }
+  }
+
+  return {
+    shouldTrigger: categories.length > 0,
+    categories
+  };
+}
+
+function getInitialWebTriggerType(message, forceWebSearch) {
+  if (forceWebSearch) {
+    return "explicit_toggle";
+  }
+
+  return classifyRetrieval(message, {
+    forceWebSearch: false,
+    hasDocumentStores: false,
+    hasUserDocuments: false,
+    hasBegRecords: false
+  }).wantsWeb
+    ? "keyword"
+    : null;
+}
+
+function mergeRetrievalMode(retrievalPlan, wantsWeb) {
+  if (!wantsWeb) {
+    return retrievalPlan.mode;
+  }
+
+  return retrievalPlan.wantsDocuments ? "hybrid" : "web";
+}
+
+function responseSuggestsMissedCurrentFacts(text) {
+  return /\b(i'?m not sure if this is still current|as of my last update|this may have changed|may have changed|might have changed|check current|verify current|not sure whether this is still current)\b/i.test(
+    String(text || "")
+  );
+}
+
+function buildChatTitle(turns) {
+  const firstUserTurn = (Array.isArray(turns) ? turns : []).find(
+    (turn) => turn?.role === "user" && String(turn.content || "").trim()
+  );
+  const title = String(firstUserTurn?.content || "New chat")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return title.length > 40 ? `${title.slice(0, 40).trim()}...` : title;
+}
+
+function serializeSessionListItem(session) {
+  return {
+    id: session.id,
+    title: buildChatTitle(session.turns),
+    updatedAt:
+      session.updatedAt?.toDate?.()?.toISOString?.() ||
+      (session.updatedAt instanceof Date ? session.updatedAt.toISOString() : null)
+  };
+}
+
+function logWebSearchTriggerSafely({
+  sessionId,
+  message,
+  triggerType,
+  categoriesMatched
+}) {
+  void firestoreLib.logWebSearchTrigger({
+    session_id: sessionId,
+    message_excerpt: String(message || "").slice(0, 200),
+    trigger_type: triggerType,
+    categories_matched: categoriesMatched || []
+  }).catch((error) => {
+    console.error("[logWebSearchTrigger]", error.message || error);
+  });
 }
 
 async function buildRagContext(session, message, globalDocs) {
@@ -1174,10 +1830,14 @@ function buildBegContext(records) {
       Number.isFinite(record.etas55)
         ? `ETAs 55: ${record.etas55}%`
         : "",
+      record.availability ? `Availability: ${record.availability}` : "",
+      record.eeIndicator ? `EE indicator: ${record.eeIndicator}` : "",
       `Page ${record.pageNumber}`
     ].filter(Boolean);
+    const source = record.source || "unknown source";
+    const lastUpdated = formatBegUpdatedDate(record.last_updated);
 
-    return `${index + 1}. ${record.manufacturer} | ${record.modelName}\n   ${details.join(" | ")}`;
+    return `${index + 1}. ${record.manufacturer} | ${record.modelName}\n   ${details.join(" | ")}\n   Source: ${source} | Last updated: ${lastUpdated}`;
   });
 
   return lines.join("\n");
@@ -1192,12 +1852,17 @@ function buildBegSourceItems(records) {
       Number.isFinite(record.etas55) ? `ETAs 55 ${record.etas55}%` : "",
       `Page ${record.pageNumber}`
     ].filter(Boolean);
+    const lastUpdated = formatBegUpdatedDate(record.last_updated);
 
     return {
       title: `${record.manufacturer} ${record.modelName}`.trim(),
       url: "",
       snippet: snippetParts.join(" | "),
-      cta: "Structured record"
+      cta: "Structured record",
+      source: record.source || null,
+      last_updated: lastUpdated === "unknown" ? null : lastUpdated,
+      lastUpdated,
+      metadataType: "beg-record"
     };
   });
 }
@@ -1213,13 +1878,12 @@ async function searchBegRecords(message, knowledgeConfig) {
   );
   const heatPumpType = detectHeatPumpType(message);
   const modelQuery = extractModelQuery(message, manufacturerMatch, heatPumpType);
-  const hasSpecificModelQuery =
-    /[0-9]/.test(modelQuery) || modelQuery.split(" ").filter(Boolean).length >= 2;
+  const hasLookupAnchor = Boolean(manufacturerMatch || heatPumpType);
 
-  if (
-    (!manufacturerMatch && !hasSpecificModelQuery) ||
-    (manufacturerMatch && !hasSpecificModelQuery && !heatPumpType)
-  ) {
+  // Structured BEG records are only useful when we can anchor the lookup to a
+  // manufacturer or a specific heat-pump type. Without that anchor, querying
+  // the whole corpus returns unrelated models for general BEG news questions.
+  if (!hasLookupAnchor) {
     return null;
   }
 
@@ -1263,6 +1927,43 @@ app.get("/api/attachments", async (req, res) => {
   const session = await getSession(sessionId, { forceRefresh });
   await pruneExpiredMediaAttachments(sessionId, session);
   return res.json({ attachments: session?.attachments || [] });
+});
+
+app.get("/api/sessions", async (_req, res) => {
+  try {
+    const sessions = await firestoreLib.listSessions(20);
+    res.json({ sessions: sessions.map(serializeSessionListItem) });
+  } catch (error) {
+    console.error("[/api/sessions]", error.message || error);
+    res.json({ sessions: [] });
+  }
+});
+
+app.get("/api/session/:sessionId", async (req, res) => {
+  const requestedSessionId =
+    typeof req.params?.sessionId === "string" ? req.params.sessionId.trim() : "";
+
+  if (!requestedSessionId) {
+    return res.status(400).json({ error: "sessionId is required" });
+  }
+
+  const storedSession = await firestoreLib.getSession(requestedSessionId);
+
+  if (!storedSession) {
+    return res.status(404).json({ error: "Session not found" });
+  }
+
+  const session = normalizeSession(storedSession);
+  sessionCache.set(requestedSessionId, session);
+  sessionCacheTouchedAt.set(requestedSessionId, Date.now());
+  await pruneExpiredMediaAttachments(requestedSessionId, session);
+
+  return res.json({
+    id: requestedSessionId,
+    title: buildChatTitle(session.turns),
+    turns: session.turns,
+    attachments: session.attachments
+  });
 });
 
 app.post("/api/upload", (req, res) => {
@@ -1356,7 +2057,10 @@ app.post("/api/upload", (req, res) => {
             displayTitle: req.file.originalname,
             sourceType: "user_upload",
             language: "en",
-            ingestionStatus: "pending",
+            ingestionStatus: "queued",
+            ingestion_status: "queued",
+            ingestion_error: null,
+            ingestion_updated_at: ingestionTimestamp(),
             scope: "session",
             isScan: false,
             geminiFileName: uploadedGeminiFileName
@@ -1444,10 +2148,24 @@ app.get("/api/ingest/status/:jobId", async (req, res) => {
     return res.status(404).json({ error: "Job not found" });
   }
 
+  const documentMeta = job.documentId
+    ? await firestoreLib.getDocument(job.documentId).catch(() => null)
+    : null;
+  const hasMetadataStatus =
+    Boolean(documentMeta?.ingestion_status || documentMeta?.ingestionStatus);
+  const status = hasMetadataStatus
+    ? normalizeDocumentIngestionStatus(documentMeta)
+    : String(job.status || "done");
+  const errorMessage =
+    documentMeta?.ingestion_error || documentMeta?.ingestionError || job.errorMessage || null;
+
   res.json({
-    status: job.status,
+    status,
     documentId: job.documentId,
-    errorMessage: job.errorMessage || null
+    errorMessage,
+    ingestion_status: status,
+    ingestion_error: errorMessage,
+    ingestion_updated_at: documentMeta?.ingestion_updated_at || null
   });
 });
 
@@ -1538,7 +2256,13 @@ app.post("/api/chat", async (req, res) => {
   const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
   const sessionId =
     typeof req.body?.sessionId === "string" ? req.body.sessionId.trim() : "";
-  const forceWebSearch = req.body?.forceWebSearch === true;
+  const webSearchMode = ["auto", "always", "off"].includes(req.body?.webSearchMode)
+    ? req.body.webSearchMode
+    : req.body?.forceWebSearch === true
+      ? "always"
+      : "auto";
+  const webSearchDisabled = webSearchMode === "off";
+  const forceWebSearch = webSearchMode === "always";
 
   if (!message || !sessionId) {
     return res.status(400).json({ error: "message and sessionId are required" });
@@ -1575,6 +2299,24 @@ app.post("/api/chat", async (req, res) => {
     const session = await getSession(sessionId);
     await pruneExpiredMediaAttachments(sessionId, session);
 
+    if (isFileFocusedQuestion(message)) {
+      const activeIngestionJobs =
+        await firestoreLib.findActiveIngestionJobsBySession(sessionId);
+
+      if (activeIngestionJobs.length) {
+        const note =
+          "I'm still processing that file — give me a moment and ask again.";
+        send({ type: "status", content: "responding" });
+        send({ type: "text", content: note });
+        session.turns.push({ role: "user", content: message });
+        session.turns.push({ role: "assistant", content: note });
+        await saveSession(sessionId, session);
+        send({ type: "done" });
+        res.end();
+        return;
+      }
+    }
+
     if (session.turns.length >= config.MAX_HISTORY_TURNS) {
       const splitIndex = Math.max(
         session.turns.length - config.SUMMARY_KEEP_TURNS,
@@ -1585,13 +2327,30 @@ app.post("/api/chat", async (req, res) => {
 
       if (toSummarize.length) {
         send({ type: "status", content: "summarizing" });
-        const newSummary = await summarizeTurns(toSummarize);
+        const [newSummary, extractedFacts] = await Promise.all([
+          summarizeTurns(toSummarize),
+          extractSessionFacts(toSummarize)
+        ]);
+        let shouldSaveCompactedSession = false;
+
+        if (extractedFacts) {
+          session.session_facts = mergeSessionFacts(
+            session.session_facts,
+            extractedFacts,
+            session.attachments
+          );
+          shouldSaveCompactedSession = true;
+        }
 
         if (newSummary) {
           session.summary = session.summary
             ? `${session.summary}\n${newSummary}`
             : newSummary;
           session.turns = toKeep;
+          shouldSaveCompactedSession = true;
+        }
+
+        if (shouldSaveCompactedSession) {
           await saveSession(sessionId, session);
         }
       }
@@ -1614,35 +2373,23 @@ app.post("/api/chat", async (req, res) => {
       ].filter(Boolean)
     )];
     const retrievalPlan = classifyRetrieval(message, {
-      forceWebSearch,
+      forceWebSearch: webSearchDisabled ? false : forceWebSearch,
       hasDocumentStores: candidateStoreNames.length > 0,
       hasUserDocuments: sessionHasIndexedDocuments,
       hasBegRecords: knowledgeConfig.begRecordCount > 0
     });
-    const shouldSearch = retrievalPlan.wantsWeb;
-    const webSearchRequest = shouldSearch
-      ? buildWebSearchRequest(message, [
-          ...config.OFFICIAL_WEB_DOMAINS,
-          ...OFFICIAL_REFERENCE_DOMAINS
-        ])
-      : null;
+    if (webSearchDisabled) {
+      retrievalPlan.wantsWeb = false;
+      retrievalPlan.mode = retrievalPlan.wantsDocuments ? "documents" : "general";
+    }
     const hasIndexedDocuments =
       retrievalPlan.wantsDocuments && candidateStoreNames.length > 0;
-    if (shouldSearch) {
-      send({ type: "status", content: "searching" });
-    }
-
-    const [webContext, ragContext, begLookup] = await Promise.all([
-      webSearchRequest
-        ? searchWeb(webSearchRequest.query, {
-            topic: webSearchRequest.topic,
-            timeRange:
-              webSearchRequest.topic === "news"
-                ? config.SEARCH_NEWS_TIME_RANGE
-                : null,
-            includeDomains: webSearchRequest.includeDomains
-          })
-        : Promise.resolve(null),
+    const initialWebTriggerType = getInitialWebTriggerType(
+      message,
+      forceWebSearch
+    );
+    const volatileTopicMatch = detectVolatileWebSearchTopics(message);
+    const [ragContext, begLookup] = await Promise.all([
       hasIndexedDocuments
         ? buildRagContext(
             session,
@@ -1654,25 +2401,83 @@ app.post("/api/chat", async (req, res) => {
         ? searchBegRecords(message, knowledgeConfig)
         : Promise.resolve(null)
     ]);
-    const fileSearchStoreNames = hasIndexedDocuments ? candidateStoreNames : [];
-    const normalizedWebContext = webContext?.context || null;
-    const webSources = webContext?.sources || [];
     const begContext = begLookup?.context || null;
     const begSources = begLookup?.sources || [];
+    const shouldTriggerVolatileSearch =
+      !webSearchDisabled &&
+      !retrievalPlan.wantsWeb &&
+      !begContext &&
+      volatileTopicMatch.shouldTrigger;
+    const shouldSearch = retrievalPlan.wantsWeb || shouldTriggerVolatileSearch;
+    const webTriggerType = shouldTriggerVolatileSearch
+      ? "volatile_topic"
+      : initialWebTriggerType;
+    const webSearchRequest = shouldSearch
+      ? buildWebSearchRequest(message, [
+          ...config.OFFICIAL_WEB_DOMAINS,
+          ...OFFICIAL_REFERENCE_DOMAINS
+        ])
+      : null;
+
+    if (shouldSearch) {
+      logWebSearchTriggerSafely({
+        sessionId,
+        message,
+        triggerType: webTriggerType || "keyword",
+        categoriesMatched: volatileTopicMatch.categories
+      });
+      send({ type: "status", content: "searching" });
+    }
+
+    const webContext = webSearchRequest
+      ? await searchWeb(webSearchRequest.query, {
+          topic: webSearchRequest.topic,
+          timeRange:
+            webSearchRequest.topic === "news"
+              ? config.SEARCH_NEWS_TIME_RANGE
+              : null,
+          includeDomains: webSearchRequest.includeDomains,
+          contextNote: shouldTriggerVolatileSearch
+            ? "Web search was triggered automatically because this question touches funding rules, laws, or pricing that change frequently."
+            : ""
+        })
+      : null;
+    const fileSearchStoreNames = hasIndexedDocuments ? candidateStoreNames : [];
+    const webSources = webContext?.sources || [];
     const mediaParts = buildMediaAttachmentParts(session.attachments);
+    const normalizedWebContext = annotateWebContextWithCitations(
+      webContext?.context || null,
+      webSources
+    );
+    const annotatedBegContext = annotateBegContextWithCitations(
+      begContext,
+      begSources,
+      webSources.length
+    );
 
     if (shouldSearch && (normalizedWebContext || webSources.length)) {
       send({ type: "status", content: "searched" });
+
+      if (shouldTriggerVolatileSearch) {
+        send({
+          type: "web_search_indicator",
+          content: {
+            reason:
+              "This question touches funding rules, laws, or pricing that can change frequently."
+          }
+        });
+      }
     }
 
     const prompt = buildPrompt({
       history: session.turns,
+      sessionFacts: buildSessionFactsBlock(session.session_facts),
       summary: session.summary,
       webContext: normalizedWebContext,
       ragContext,
-      begContext,
+      begContext: annotatedBegContext,
       userMessage: message,
-      mode: retrievalPlan.mode
+      mode: mergeRetrievalMode(retrievalPlan, shouldSearch)
     });
 
     if (clientClosed) {
@@ -1736,7 +2541,29 @@ app.post("/api/chat", async (req, res) => {
     session.turns.push({ role: "assistant", content: fullResponse.trim() });
     await saveSession(sessionId, session);
 
-    const documentSources = extractDocumentSources(lastGroundingMetadata);
+    if (!shouldSearch && responseSuggestsMissedCurrentFacts(fullResponse)) {
+      logWebSearchTriggerSafely({
+        sessionId,
+        message,
+        triggerType: "no_trigger_but_relevant",
+        categoriesMatched: volatileTopicMatch.categories
+      });
+    }
+
+    const documentSources = extractDocumentSources(
+      lastGroundingMetadata,
+      session.attachments
+    );
+    const citations = buildCitations({
+      webSources,
+      begSources,
+      documentSources
+    });
+
+    send({
+      type: "citations",
+      content: citations
+    });
 
     if (documentSources.length) {
       send({
